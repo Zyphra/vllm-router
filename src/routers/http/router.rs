@@ -428,7 +428,8 @@ impl Router {
 
         match self.select_first_worker() {
             Ok(worker_url) => {
-                let url = format!("{}/{}", worker_url, endpoint);
+                let base_url = self.worker_base_url(&worker_url);
+                let url = format!("{}/{}", base_url, endpoint);
                 let route_name = format!("/{}", endpoint);
                 let mut request_builder = self.client.get(&url);
                 for (name, value) in headers {

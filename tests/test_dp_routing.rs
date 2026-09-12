@@ -357,6 +357,17 @@ mod dp_e2e_tests {
         // Wait for health checks
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
+        // Readiness uses the explicit GET path, not the completion proxy.
+        let models = router
+            .get_models(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(models.status().as_u16(), 200);
+
         // Create test app with transparent proxy enabled
         let app = common::test_app::create_test_app(Arc::clone(&router), Client::new(), &config);
 
