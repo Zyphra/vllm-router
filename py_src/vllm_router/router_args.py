@@ -32,7 +32,6 @@ class RouterArgs:
     balance_rel_threshold: float = 1.5
     eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
-    session_affinity: bool = False
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     intra_node_data_parallel_size: int = (
         1  # Intra-node data parallel size (DP-aware routing automatically enabled when > 1)
@@ -90,6 +89,8 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    # Keep new optional fields at the end for positional-call compatibility.
+    session_affinity: bool = False
 
     @staticmethod
     def add_cli_args(
