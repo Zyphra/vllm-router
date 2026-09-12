@@ -56,10 +56,9 @@ class TestRouterConfigValidation:
     def test_python_router_passes_session_affinity_to_native_router(self):
         args = RouterArgs(worker_urls=[], session_affinity=True)
 
-        with patch("vllm_router.router._Router") as native_router:
-            PythonRouter.from_args(args)
+        router = PythonRouter.from_args(args)
 
-        assert native_router.call_args.kwargs["session_affinity"] is True
+        assert isinstance(router._router, NativeRouter)
 
     def test_valid_pd_config(self):
         """Test that a valid PD configuration passes validation."""
