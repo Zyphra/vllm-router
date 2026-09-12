@@ -191,6 +191,7 @@ impl PolicyRegistry {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                session_affinity,
             } => {
                 let cache_config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -198,6 +199,7 @@ impl PolicyRegistry {
                     balance_rel_threshold: *balance_rel_threshold,
                     eviction_interval_secs: *eviction_interval_secs,
                     max_tree_size: *max_tree_size,
+                    session_affinity: *session_affinity,
                 };
                 Arc::new(CacheAwarePolicy::with_config(cache_config))
             }

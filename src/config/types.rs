@@ -230,6 +230,9 @@ pub enum PolicyConfig {
         eviction_interval_secs: u64,
         /// Maximum cache tree size per tenant
         max_tree_size: usize,
+        /// Route requests with a nonempty X-Session-ID using consistent hashing
+        #[serde(default)]
+        session_affinity: bool,
     },
 
     #[serde(rename = "power_of_two")]
@@ -707,6 +710,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            session_affinity: false,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -730,11 +734,13 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            session_affinity: true,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
         assert!(json.contains("\"cache_threshold\":0.8"));
         assert!(json.contains("\"balance_abs_threshold\":10"));
+        assert!(json.contains("\"session_affinity\":true"));
 
         // Test PowerOfTwo
         let power_of_two = PolicyConfig::PowerOfTwo {
@@ -746,6 +752,26 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_aware_session_affinity_defaults_to_disabled() {
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.8,
+            "balance_abs_threshold": 10,
+            "balance_rel_threshold": 1.5,
+            "eviction_interval_secs": 300,
+            "max_tree_size": 1000
+        }"#;
+
+        let policy: PolicyConfig = serde_json::from_str(json).unwrap();
+        match policy {
+            PolicyConfig::CacheAware {
+                session_affinity, ..
+            } => assert!(!session_affinity),
+            _ => panic!("Expected CacheAware"),
+        }
+    }
+
+    #[test]
     fn test_cache_aware_parameters() {
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.75,
@@ -753,6 +779,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 600,
             max_tree_size: 5000,
+            session_affinity: true,
         };
 
         match cache_aware {
@@ -762,12 +789,14 @@ mod tests {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                session_affinity,
             } => {
                 assert!((cache_threshold - 0.75).abs() < 0.0001);
                 assert_eq!(balance_abs_threshold, 20);
                 assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
                 assert_eq!(eviction_interval_secs, 600);
                 assert_eq!(max_tree_size, 5000);
+                assert!(session_affinity);
             }
             _ => panic!("Expected CacheAware"),
         }
@@ -1081,6 +1110,7 @@ mod tests {
                 balance_rel_threshold: 1.2,
                 eviction_interval_secs: 600,
                 max_tree_size: 10000,
+                session_affinity: false,
             },
             host: "0.0.0.0".to_string(),
             port: 3001,
@@ -1213,6 +1243,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                session_affinity: false,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1246,6 +1277,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                session_affinity: false,
             }),
             decode_policy: None,
             discovery_address: None,
@@ -1311,6 +1343,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 2000,
+            session_affinity: false,
         };
 
         // Both should fall back to main policy

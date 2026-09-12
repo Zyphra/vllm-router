@@ -59,7 +59,10 @@
     during the next eviction cycle.
 */
 
-use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RequestHeaders};
+use super::{
+    get_healthy_worker_indices, CacheAwareConfig, ConsistentHashPolicy, LoadBalancingPolicy,
+    RequestHeaders,
+};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use crate::policies::normalize_model_key;
@@ -80,6 +83,7 @@ use tracing::{debug, info};
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
+    session_policy: ConsistentHashPolicy,
     trees: Arc<DashMap<String, Arc<Tree>>>, // model_id -> Arc<Tree>
     eviction_handle: Option<thread::JoinHandle<()>>,
 }
@@ -118,6 +122,7 @@ impl CacheAwarePolicy {
 
         Self {
             config,
+            session_policy: ConsistentHashPolicy::new(),
             trees,
             eviction_handle,
         }
@@ -230,8 +235,18 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
-        _headers: Option<&RequestHeaders>,
+        headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
+        if self.config.session_affinity
+            && headers
+                .and_then(|headers| headers.get("x-session-id"))
+                .is_some_and(|session_id| !session_id.is_empty())
+        {
+            return self
+                .session_policy
+                .select_worker_with_headers(workers, request_text, headers);
+        }
+
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
@@ -365,6 +380,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         true // Cache-aware policy needs request text for cache affinity
     }
 
+    fn needs_headers(&self) -> bool {
+        self.config.session_affinity
+    }
+
     fn on_request_complete(&self, worker_url: &str, success: bool) {
         // Could track success rates per worker for more intelligent routing
         if !success {
@@ -479,6 +498,23 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
 
+    fn test_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
+        urls.iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new((*url).to_string(), WorkerType::Regular))
+                    as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    fn session_affinity_policy(enabled: bool) -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            session_affinity: enabled,
+            ..Default::default()
+        })
+    }
+
     #[test]
     fn test_cache_aware_with_balanced_load() {
         // Create policy without eviction thread for testing
@@ -521,6 +557,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
+            session_affinity: false,
         });
 
         let worker1 = BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular);
@@ -573,5 +610,128 @@ mod tests {
         // All requests should now go to worker2
         let idx = policy.select_worker(&workers, Some("test1")).unwrap();
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn test_session_affinity_is_stable_as_prompt_grows() {
+        let policy = session_affinity_policy(true);
+        let workers = test_workers(&[
+            "http://worker-a.example:8000",
+            "http://worker-b.example:8000",
+            "http://worker-c.example:8000",
+        ]);
+        policy.init_workers(&workers);
+
+        let headers =
+            RequestHeaders::from([("x-session-id".to_string(), "conversation-42".to_string())]);
+        let prompts = [
+            r#"{"prompt":"hello"}"#,
+            r#"{"prompt":"hello, continue with a longer turn"}"#,
+            r#"{"prompt":"a completely different serialized request body"}"#,
+        ];
+
+        let selected = policy
+            .select_worker_with_headers(&workers, Some(prompts[0]), Some(&headers))
+            .unwrap();
+        for prompt in &prompts[1..] {
+            assert_eq!(
+                policy.select_worker_with_headers(&workers, Some(prompt), Some(&headers)),
+                Some(selected)
+            );
+        }
+        assert!(policy.needs_headers());
+    }
+
+    #[test]
+    fn test_headerless_request_keeps_prefix_selection() {
+        let policy = session_affinity_policy(true);
+        let workers = test_workers(&[
+            "http://worker-a.example:8000",
+            "http://worker-b.example:8000",
+        ]);
+        policy.init_workers(&workers);
+
+        let first = policy
+            .select_worker_with_headers(&workers, Some("shared prefix"), None)
+            .unwrap();
+        let growing = policy
+            .select_worker_with_headers(&workers, Some("shared prefix!"), None)
+            .unwrap();
+
+        assert_eq!(growing, first);
+    }
+
+    #[test]
+    fn test_empty_session_header_keeps_prefix_selection() {
+        let policy = session_affinity_policy(true);
+        let workers = test_workers(&[
+            "http://worker-a.example:8000",
+            "http://worker-b.example:8000",
+        ]);
+        policy.init_workers(&workers);
+        let headers = RequestHeaders::from([("x-session-id".to_string(), String::new())]);
+
+        let first = policy
+            .select_worker_with_headers(&workers, Some("empty header prefix"), Some(&headers))
+            .unwrap();
+        let growing = policy
+            .select_worker_with_headers(&workers, Some("empty header prefix!"), Some(&headers))
+            .unwrap();
+
+        assert_eq!(growing, first);
+    }
+
+    #[test]
+    fn test_session_affinity_preserves_dp_worker_identity() {
+        let policy = session_affinity_policy(true);
+        let workers = test_workers(&[
+            "http://node-a.example:8000@0",
+            "http://node-a.example:8000@1",
+            "http://node-b.example:8000@0",
+            "http://node-b.example:8000@1",
+        ]);
+        policy.init_workers(&workers);
+        let headers =
+            RequestHeaders::from([("x-session-id".to_string(), "dp-conversation".to_string())]);
+
+        let first = policy
+            .select_worker_with_headers(&workers, Some("turn one"), Some(&headers))
+            .unwrap();
+        let second = policy
+            .select_worker_with_headers(&workers, Some("turn two"), Some(&headers))
+            .unwrap();
+
+        assert_eq!(second, first);
+        assert!(workers[first].url().contains('@'));
+    }
+
+    #[test]
+    fn test_disabled_session_affinity_matches_existing_cache_path() {
+        let disabled = session_affinity_policy(false);
+        let baseline = session_affinity_policy(false);
+        let workers = test_workers(&[
+            "http://worker-a.example:8000",
+            "http://worker-b.example:8000",
+        ]);
+        disabled.init_workers(&workers);
+        baseline.init_workers(&workers);
+        let headers = RequestHeaders::from([(
+            "x-session-id".to_string(),
+            "ignored-when-disabled".to_string(),
+        )]);
+
+        assert_eq!(
+            disabled.select_worker_with_headers(
+                &workers,
+                Some("unchanged cache-aware prompt"),
+                Some(&headers),
+            ),
+            baseline.select_worker_with_headers(
+                &workers,
+                Some("unchanged cache-aware prompt"),
+                None,
+            )
+        );
+        assert!(!disabled.needs_headers());
     }
 }

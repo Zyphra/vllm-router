@@ -159,6 +159,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 67108864)] // 2^26
     max_tree_size: usize,
 
+    /// Route cache-aware requests with a nonempty X-Session-ID using consistent hashing
+    #[arg(long, default_value_t = false)]
+    session_affinity: bool,
+
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
     max_payload_size: usize,
@@ -365,6 +369,7 @@ impl CliArgs {
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+                session_affinity: self.session_affinity,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5, // Default value
@@ -737,4 +742,27 @@ Provide --worker-urls or PD flags as usual.",
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_affinity_cli_reaches_cache_aware_config() {
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--policy",
+            "cache_aware",
+            "--session-affinity",
+        ])
+        .unwrap();
+
+        match args.parse_policy("cache_aware") {
+            PolicyConfig::CacheAware {
+                session_affinity, ..
+            } => assert!(session_affinity),
+            _ => panic!("Expected CacheAware"),
+        }
+    }
 }
