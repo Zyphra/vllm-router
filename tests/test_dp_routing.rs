@@ -352,7 +352,6 @@ mod dp_e2e_tests {
         let config = make_regular_config(vec![worker_url.clone()], 2);
         let app_context = common::create_test_context(config.clone());
         let router = RouterFactory::create_router(&app_context).await.unwrap();
-        let router = Arc::from(router);
 
         // Wait for health checks
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -367,6 +366,8 @@ mod dp_e2e_tests {
             )
             .await;
         assert_eq!(models.status().as_u16(), 200);
+
+        let router = Arc::from(router);
 
         // Create test app with transparent proxy enabled
         let app = common::test_app::create_test_app(Arc::clone(&router), Client::new(), &config);
