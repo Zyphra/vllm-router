@@ -9,8 +9,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm_router.launch_router import RouterArgs, launch_router
+from vllm_router.router import Router as PythonRouter
 from vllm_router.router import policy_from_str
 from vllm_router_rs import PolicyType
+from vllm_router_rs import Router as NativeRouter
 
 
 class TestRouterConfigValidation:
@@ -30,6 +32,34 @@ class TestRouterConfigValidation:
         assert args.port == 30000
         assert args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert args.policy == "cache_aware"
+
+    def test_native_router_preserves_old_positional_prefix_and_new_keyword(self):
+        old_positional_prefix = NativeRouter(
+            [],
+            PolicyType.CacheAware,
+            "127.0.0.1",
+            3001,
+            600,
+            30,
+            0.3,
+            64,
+            1.5,
+            120,
+            2**26,
+            512 * 1024 * 1024,
+        )
+        keyword_opt_in = NativeRouter(worker_urls=[], session_affinity=True)
+
+        assert old_positional_prefix is not None
+        assert keyword_opt_in is not None
+
+    def test_python_router_passes_session_affinity_to_native_router(self):
+        args = RouterArgs(worker_urls=[], session_affinity=True)
+
+        with patch("vllm_router.router._Router") as native_router:
+            PythonRouter.from_args(args)
+
+        assert native_router.call_args.kwargs["session_affinity"] is True
 
     def test_valid_pd_config(self):
         """Test that a valid PD configuration passes validation."""

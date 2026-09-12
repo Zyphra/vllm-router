@@ -258,7 +258,6 @@ impl Router {
         balance_rel_threshold = 1.5,
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
-        session_affinity = false,
         max_payload_size = 512 * 1024 * 1024,  // 512MB default for large batches
         intra_node_data_parallel_size = 1,
         api_key = None,
@@ -313,6 +312,8 @@ impl Router {
         otlp_traces_endpoint = None,
         // KV connector default (PD disaggregation)
         kv_connector = String::from("nixl"),
+        // Keep new optional arguments at the end for positional-call compatibility.
+        session_affinity = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -327,7 +328,6 @@ impl Router {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
-        session_affinity: bool,
         max_payload_size: usize,
         intra_node_data_parallel_size: usize,
         api_key: Option<String>,
@@ -376,6 +376,7 @@ impl Router {
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
         kv_connector: String,
+        session_affinity: bool,
     ) -> PyResult<Self> {
         Ok(Router {
             host,

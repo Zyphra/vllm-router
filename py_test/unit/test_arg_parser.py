@@ -27,6 +27,7 @@ class TestRouterArgs:
         assert args.vllm_pd_disaggregation is False
         assert args.prefill_urls == []
         assert args.decode_urls == []
+        assert args.session_affinity is False
 
         # Test PD-specific defaults
         assert args.prefill_policy is None
@@ -43,6 +44,11 @@ class TestRouterArgs:
         assert args.cb_failure_threshold == 10
         assert args.disable_retries is False
         assert args.disable_circuit_breaker is False
+
+    def test_parse_session_affinity(self):
+        args = parse_router_args(["--session-affinity"])
+
+        assert args.session_affinity is True
 
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""

@@ -122,7 +122,7 @@ impl CacheAwarePolicy {
 
         Self {
             config,
-            session_policy: ConsistentHashPolicy::new(),
+            session_policy: ConsistentHashPolicy::with_metrics_policy_name("cache_aware"),
             trees,
             eviction_handle,
         }
@@ -242,9 +242,23 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 .and_then(|headers| headers.get("x-session-id"))
                 .is_some_and(|session_id| !session_id.is_empty())
         {
-            return self
-                .session_policy
-                .select_worker_with_headers(workers, request_text, headers);
+            let selected_idx =
+                self.session_policy
+                    .select_worker_with_headers(workers, request_text, headers)?;
+
+            if let Some(text) = request_text {
+                let model_id = normalize_model_key(workers[selected_idx].model_id());
+                if let Some(tree) = self.trees.get(model_id) {
+                    tree.insert(text, workers[selected_idx].url());
+                } else {
+                    debug!(
+                        "Warning: No tree found for model '{}', skipping cache update",
+                        model_id
+                    );
+                }
+            }
+
+            return Some(selected_idx);
         }
 
         let healthy_indices = get_healthy_worker_indices(workers);
@@ -639,7 +653,47 @@ mod tests {
                 Some(selected)
             );
         }
+        assert_eq!(workers[selected].processed_requests(), prompts.len());
+        assert_eq!(
+            workers
+                .iter()
+                .map(|worker| worker.processed_requests())
+                .sum::<usize>(),
+            prompts.len()
+        );
         assert!(policy.needs_headers());
+    }
+
+    #[test]
+    fn test_session_request_seeds_prefix_tree_for_headerless_followup() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            session_affinity: true,
+            balance_abs_threshold: usize::MAX,
+            ..Default::default()
+        });
+        let workers = test_workers(&[
+            "http://worker-a.example:8000",
+            "http://worker-b.example:8000",
+        ]);
+        policy.init_workers(&workers);
+        let headers =
+            RequestHeaders::from([("x-session-id".to_string(), "seed-prefix-tree".to_string())]);
+
+        let session_worker = policy
+            .select_worker_with_headers(
+                &workers,
+                Some("session seeded shared prefix"),
+                Some(&headers),
+            )
+            .unwrap();
+        workers[session_worker].increment_load();
+
+        let headerless_worker = policy
+            .select_worker_with_headers(&workers, Some("session seeded shared prefix!"), None)
+            .unwrap();
+
+        assert_eq!(headerless_worker, session_worker);
     }
 
     #[test]

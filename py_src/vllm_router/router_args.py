@@ -32,6 +32,7 @@ class RouterArgs:
     balance_rel_threshold: float = 1.5
     eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
+    session_affinity: bool = False
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     intra_node_data_parallel_size: int = (
         1  # Intra-node data parallel size (DP-aware routing automatically enabled when > 1)
@@ -237,6 +238,11 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_tree_size,
             help="Maximum size of the approximation tree for cache-aware routing",
+        )
+        parser.add_argument(
+            f"--{prefix}session-affinity",
+            action="store_true",
+            help="Route cache-aware requests with a nonempty X-Session-ID using consistent hashing",
         )
         parser.add_argument(
             f"--{prefix}max-payload-size",

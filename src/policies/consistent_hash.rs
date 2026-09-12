@@ -30,6 +30,8 @@ pub struct ConsistentHashPolicy {
     hash_ring: RwLock<BTreeMap<u64, String>>,
     /// Current set of workers (for detecting changes)
     current_workers: RwLock<Vec<String>>,
+    /// Policy label used for decision metrics when this policy is composed by another policy.
+    metrics_policy_name: &'static str,
 }
 
 impl ConsistentHashPolicy {
@@ -37,6 +39,14 @@ impl ConsistentHashPolicy {
         Self {
             hash_ring: RwLock::new(BTreeMap::new()),
             current_workers: RwLock::new(Vec::new()),
+            metrics_policy_name: "consistent_hash",
+        }
+    }
+
+    pub(crate) fn with_metrics_policy_name(metrics_policy_name: &'static str) -> Self {
+        Self {
+            metrics_policy_name,
+            ..Self::new()
         }
     }
 
@@ -376,7 +386,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
                     worker_url
                 );
                 RouterMetrics::record_processed_request(worker_url);
-                RouterMetrics::record_policy_decision(self.name(), worker_url);
+                RouterMetrics::record_policy_decision(self.metrics_policy_name, worker_url);
                 return Some(fallback_idx);
             }
         };
@@ -418,7 +428,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
                     // Increment processed counter
                     workers[idx].increment_processed();
                     RouterMetrics::record_processed_request(worker_url);
-                    RouterMetrics::record_policy_decision(self.name(), worker_url);
+                    RouterMetrics::record_policy_decision(self.metrics_policy_name, worker_url);
 
                     Some(idx)
                 } else {
@@ -432,7 +442,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
 
                     workers[fallback_idx].increment_processed();
                     RouterMetrics::record_processed_request(worker_url);
-                    RouterMetrics::record_policy_decision(self.name(), worker_url);
+                    RouterMetrics::record_policy_decision(self.metrics_policy_name, worker_url);
 
                     Some(fallback_idx)
                 }
@@ -448,7 +458,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
 
                 workers[fallback_idx].increment_processed();
                 RouterMetrics::record_processed_request(worker_url);
-                RouterMetrics::record_policy_decision(self.name(), worker_url);
+                RouterMetrics::record_policy_decision(self.metrics_policy_name, worker_url);
 
                 Some(fallback_idx)
             }

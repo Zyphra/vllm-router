@@ -46,6 +46,8 @@ class Router:
             routing. Default: 60
         max_payload_size: Maximum payload size in bytes. Default: 256MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
+        session_affinity: Route cache-aware requests with a nonempty X-Session-ID using
+            consistent hashing. Default: False
         intra_node_data_parallel_size: Data parallel size for DP-aware routing (automatically enabled when > 1). Default: 1
         enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When enabled,
             the router can manage multiple models simultaneously with per-model load balancing
