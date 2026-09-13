@@ -1729,6 +1729,7 @@ impl RouterTrait for Router {
         }
 
         // Send request
+        let started = Instant::now();
         match otel_http::send_client_request(
             request_builder,
             headers,
@@ -1764,11 +1765,19 @@ impl RouterTrait for Router {
                         .into_response(),
                 }
             }
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                format!("Backend request failed: {}", e),
-            )
-                .into_response(),
+            Err(e) => {
+                let detail = format!(
+                    "Backend request failed: {e:?}; elapsed_ms={}; timeout={}; connect={}; request_id={:?}; session_id={:?}; worker_index={worker_idx}; dp_rank={:?}",
+                    started.elapsed().as_millis(),
+                    e.is_timeout(),
+                    e.is_connect(),
+                    body.get("request_id").and_then(|value| value.as_str()),
+                    headers.and_then(|headers| headers.get("x-session-id")).and_then(|value| value.to_str().ok()),
+                    worker.dp_rank(),
+                );
+                error!(method = %method, route = path, "{detail}");
+                (StatusCode::BAD_GATEWAY, detail).into_response()
+            }
         }
     }
 }
