@@ -59,6 +59,7 @@ struct Router {
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
+    pool_idle_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
     vllm_pd_disaggregation: bool,
     vllm_discovery_address: Option<String>,
@@ -310,6 +311,7 @@ impl Router {
         otlp_traces_endpoint = None,
         // KV connector default (PD disaggregation)
         kv_connector = String::from("nixl"),
+        pool_idle_timeout_secs = 4,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -372,6 +374,7 @@ impl Router {
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
         kv_connector: String,
+        pool_idle_timeout_secs: u64,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -401,6 +404,7 @@ impl Router {
             prometheus_port,
             prometheus_host,
             request_timeout_secs,
+            pool_idle_timeout_secs,
             request_id_headers,
             vllm_pd_disaggregation,
             vllm_discovery_address,
@@ -493,6 +497,7 @@ impl Router {
                 service_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
+                pool_idle_timeout_secs: self.pool_idle_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
                 trace_config: if self.enable_trace {
                     Some(config::TraceConfig {

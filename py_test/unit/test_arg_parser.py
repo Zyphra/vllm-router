@@ -419,6 +419,12 @@ class TestPolicyFromStr:
 class TestParseRouterArgs:
     """Test the parse_router_args function."""
 
+    @pytest.mark.parametrize("value", [None, 2, 0])
+    def test_pool_idle_timeout(self, value):
+        argv = [] if value is None else ["--pool-idle-timeout-secs", str(value)]
+        args = parse_router_args(argv)
+        assert args.pool_idle_timeout_secs == (4 if value is None else value)
+
     def test_parse_basic_args(self):
         """Test parsing basic router arguments."""
         args = [

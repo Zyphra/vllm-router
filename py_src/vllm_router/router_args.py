@@ -89,6 +89,7 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    pool_idle_timeout_secs: int = 4
 
     @staticmethod
     def add_cli_args(
@@ -352,6 +353,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.request_timeout_secs,
             help="Request timeout in seconds",
+        )
+        parser.add_argument(
+            f"--{prefix}pool-idle-timeout-secs",
+            type=int,
+            default=RouterArgs.pool_idle_timeout_secs,
+            help="Idle connection lifetime; keep below the backend Uvicorn default of 5 seconds",
         )
         # Retry configuration
         parser.add_argument(
