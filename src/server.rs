@@ -685,6 +685,7 @@ pub struct ServerConfig {
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
+    pub pool_idle_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
     pub trace_config: Option<TraceConfig>,
 }
@@ -856,7 +857,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     println!("DEBUG: Creating HTTP client");
     let client = Client::builder()
-        .pool_idle_timeout(Some(Duration::from_secs(50)))
+        .pool_idle_timeout(Some(Duration::from_secs(config.pool_idle_timeout_secs)))
         .pool_max_idle_per_host(500)
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect_timeout(Duration::from_secs(10))

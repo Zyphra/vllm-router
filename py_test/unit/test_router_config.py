@@ -60,6 +60,40 @@ class TestRouterConfigValidation:
 
         assert isinstance(router._router, NativeRouter)
 
+    def test_pool_idle_timeout_preserves_positional_request_headers(self):
+        router = NativeRouter(
+            [],
+            PolicyType.CacheAware,
+            "127.0.0.1",
+            30000,
+            600,
+            30,
+            0.3,
+            64,
+            1.5,
+            120,
+            2**26,
+            512 * 1024 * 1024,
+            1,
+            None,
+            [],
+            None,
+            None,
+            False,
+            {},
+            80,
+            None,
+            {},
+            {},
+            "vllm.ai/bootstrap-port",
+            None,
+            None,
+            1800,
+            ["x-request-id"],
+            pool_idle_timeout_secs=4,
+        )
+        assert isinstance(router, NativeRouter)
+
     def test_valid_pd_config(self):
         """Test that a valid PD configuration passes validation."""
         args = RouterArgs(

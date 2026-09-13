@@ -91,6 +91,7 @@ class RouterArgs:
     disable_circuit_breaker: bool = False
     # Keep new optional fields at the end for positional-call compatibility.
     session_affinity: bool = False
+    pool_idle_timeout_secs: int = 4
 
     @staticmethod
     def add_cli_args(
@@ -359,6 +360,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.request_timeout_secs,
             help="Request timeout in seconds",
+        )
+        parser.add_argument(
+            f"--{prefix}pool-idle-timeout-secs",
+            type=int,
+            default=RouterArgs.pool_idle_timeout_secs,
+            help="Idle connection lifetime; keep below the backend Uvicorn default of 5 seconds",
         )
         # Retry configuration
         parser.add_argument(
