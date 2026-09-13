@@ -1736,6 +1736,7 @@ impl RouterTrait for Router {
         }
 
         // Send request
+        let started = Instant::now();
         match otel_http::send_client_request(
             request_builder,
             headers,
@@ -1771,11 +1772,19 @@ impl RouterTrait for Router {
                         .into_response(),
                 }
             }
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                format!("Backend request failed: {}", e),
-            )
-                .into_response(),
+            Err(e) => {
+                let detail = format!(
+                    "Backend request failed: {e:?}; elapsed_ms={}; timeout={}; connect={}; request_id={:?}; session_id={:?}; worker_index={worker_idx}; dp_rank={:?}",
+                    started.elapsed().as_millis(),
+                    e.is_timeout(),
+                    e.is_connect(),
+                    body.get("request_id").and_then(|value| value.as_str()),
+                    headers.and_then(|headers| headers.get("x-session-id")).and_then(|value| value.to_str().ok()),
+                    worker.dp_rank(),
+                );
+                error!(method = %method, route = path, "{detail}");
+                (StatusCode::BAD_GATEWAY, detail).into_response()
+            }
         }
     }
 }
@@ -1822,6 +1831,61 @@ mod tests {
         assert_eq!(urls.len(), 2);
         assert!(urls.contains(&"http://worker1:8080".to_string()));
         assert!(urls.contains(&"http://worker2:8080".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_transparent_backend_error_preserves_cause_and_request_context() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        for timeout in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let backend = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await.unwrap();
+                if timeout {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                // Close the real connection without returning an HTTP response.
+            });
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router
+                .worker_registry
+                .register(Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular)));
+            router.client = Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("x-session-id", HeaderValue::from_static("test-session"));
+            let response = router
+                .route_transparent(
+                    Some(&headers),
+                    "/verl/v1/generate",
+                    &Method::POST,
+                    serde_json::json!({
+                        "request_id": "test-request",
+                        "prompt": "prompt-must-not-be-logged",
+                    }),
+                )
+                .await;
+            backend.abort();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let detail = String::from_utf8(body.to_vec()).unwrap();
+            assert!(detail.contains("source:"), "{detail}");
+            assert!(detail.contains(&format!("timeout={timeout}")), "{detail}");
+            assert!(detail.contains("connect=false"), "{detail}");
+            assert!(detail.contains("elapsed_ms="), "{detail}");
+            assert!(detail.contains("test-request"), "{detail}");
+            assert!(detail.contains("test-session"), "{detail}");
+            assert!(detail.contains(&url), "{detail}");
+            assert!(!detail.contains("prompt-must-not-be-logged"), "{detail}");
+        }
     }
 
     #[test]
