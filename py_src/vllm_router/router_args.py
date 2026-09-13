@@ -60,6 +60,7 @@ class RouterArgs:
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
     request_timeout_secs: int = 1800
+    pool_idle_timeout_secs: int = 4
     # Max concurrent requests for rate limiting
     max_concurrent_requests: int = 32768
     # Queue size for pending requests when max concurrent limit reached
@@ -352,6 +353,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.request_timeout_secs,
             help="Request timeout in seconds",
+        )
+        parser.add_argument(
+            f"--{prefix}pool-idle-timeout-secs",
+            type=int,
+            default=RouterArgs.pool_idle_timeout_secs,
+            help="Idle connection lifetime; keep below the backend Uvicorn default of 5 seconds",
         )
         # Retry configuration
         parser.add_argument(

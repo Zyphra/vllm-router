@@ -59,6 +59,7 @@ struct Router {
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
+    pool_idle_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
     vllm_pd_disaggregation: bool,
     vllm_discovery_address: Option<String>,
@@ -272,6 +273,7 @@ impl Router {
         prometheus_port = None,
         prometheus_host = None,
         request_timeout_secs = 1800,  // Add configurable request timeout
+        pool_idle_timeout_secs = 4,
         request_id_headers = None,  // Custom request ID headers
         vllm_pd_disaggregation = false,  // New flag for PD mode
         vllm_discovery_address = None,
@@ -340,6 +342,7 @@ impl Router {
         prometheus_port: Option<u16>,
         prometheus_host: Option<String>,
         request_timeout_secs: u64,
+        pool_idle_timeout_secs: u64,
         request_id_headers: Option<Vec<String>>,
         vllm_pd_disaggregation: bool,
         vllm_discovery_address: Option<String>,
@@ -401,6 +404,7 @@ impl Router {
             prometheus_port,
             prometheus_host,
             request_timeout_secs,
+            pool_idle_timeout_secs,
             request_id_headers,
             vllm_pd_disaggregation,
             vllm_discovery_address,
@@ -493,6 +497,7 @@ impl Router {
                 service_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
+                pool_idle_timeout_secs: self.pool_idle_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
                 trace_config: if self.enable_trace {
                     Some(config::TraceConfig {
