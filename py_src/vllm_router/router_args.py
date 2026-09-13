@@ -60,7 +60,6 @@ class RouterArgs:
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
     request_timeout_secs: int = 1800
-    pool_idle_timeout_secs: int = 4
     # Max concurrent requests for rate limiting
     max_concurrent_requests: int = 32768
     # Queue size for pending requests when max concurrent limit reached
@@ -90,6 +89,7 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    pool_idle_timeout_secs: int = 4
 
     @staticmethod
     def add_cli_args(

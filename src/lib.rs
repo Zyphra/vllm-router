@@ -273,7 +273,6 @@ impl Router {
         prometheus_port = None,
         prometheus_host = None,
         request_timeout_secs = 1800,  // Add configurable request timeout
-        pool_idle_timeout_secs = 4,
         request_id_headers = None,  // Custom request ID headers
         vllm_pd_disaggregation = false,  // New flag for PD mode
         vllm_discovery_address = None,
@@ -312,6 +311,7 @@ impl Router {
         otlp_traces_endpoint = None,
         // KV connector default (PD disaggregation)
         kv_connector = String::from("nixl"),
+        pool_idle_timeout_secs = 4,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -342,7 +342,6 @@ impl Router {
         prometheus_port: Option<u16>,
         prometheus_host: Option<String>,
         request_timeout_secs: u64,
-        pool_idle_timeout_secs: u64,
         request_id_headers: Option<Vec<String>>,
         vllm_pd_disaggregation: bool,
         vllm_discovery_address: Option<String>,
@@ -375,6 +374,7 @@ impl Router {
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
         kv_connector: String,
+        pool_idle_timeout_secs: u64,
     ) -> PyResult<Self> {
         Ok(Router {
             host,

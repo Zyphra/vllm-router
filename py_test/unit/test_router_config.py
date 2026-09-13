@@ -11,6 +11,7 @@ import pytest
 from vllm_router.launch_router import RouterArgs, launch_router
 from vllm_router.router import policy_from_str
 from vllm_router_rs import PolicyType
+from vllm_router_rs import Router as NativeRouter
 
 
 class TestRouterConfigValidation:
@@ -30,6 +31,40 @@ class TestRouterConfigValidation:
         assert args.port == 30000
         assert args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert args.policy == "cache_aware"
+
+    def test_pool_idle_timeout_preserves_positional_request_headers(self):
+        router = NativeRouter(
+            [],
+            PolicyType.CacheAware,
+            "127.0.0.1",
+            30000,
+            600,
+            30,
+            0.3,
+            64,
+            1.5,
+            120,
+            2**26,
+            512 * 1024 * 1024,
+            1,
+            None,
+            [],
+            None,
+            None,
+            False,
+            {},
+            80,
+            None,
+            {},
+            {},
+            "vllm.ai/bootstrap-port",
+            None,
+            None,
+            1800,
+            ["x-request-id"],
+            pool_idle_timeout_secs=4,
+        )
+        assert isinstance(router, NativeRouter)
 
     def test_valid_pd_config(self):
         """Test that a valid PD configuration passes validation."""
