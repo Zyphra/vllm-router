@@ -1712,6 +1712,8 @@ pub struct Function {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub parameters: Value, // JSON Schema
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3271,6 +3273,59 @@ mod tests {
 
         let roundtrip: ChatCompletionRequest = serde_json::from_str(&serialized).unwrap();
         assert!(roundtrip.model.is_none());
+    }
+
+    #[test]
+    fn test_chat_completion_function_strict_roundtrip() {
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Use a tool"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "strict_true",
+                        "description": "Strict true tool",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                            "required": ["value"]
+                        },
+                        "strict": true
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "strict_false",
+                        "description": "Strict false tool",
+                        "parameters": {"type": "object", "properties": {}},
+                        "strict": false
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "strict_absent",
+                        "description": "No strict field",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }
+            ]
+        });
+
+        let request: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+        let forwarded = serde_json::to_value(request).unwrap();
+
+        for index in 0..3 {
+            assert_eq!(
+                forwarded["tools"][index]["function"],
+                body["tools"][index]["function"]
+            );
+        }
+        assert_eq!(forwarded["tools"][0]["function"]["strict"], true);
+        assert_eq!(forwarded["tools"][1]["function"]["strict"], false);
+        assert!(forwarded["tools"][2]["function"].get("strict").is_none());
     }
 
     #[test]
