@@ -337,12 +337,15 @@ impl Router {
         }
     }
 
+    /// Origin of the first worker for worker-level GETs (models, info). A
+    /// data-parallel worker's registry URL carries an `@rank` suffix that is not
+    /// part of its HTTP origin, so use the base URL.
     fn select_first_worker(&self) -> Result<String, String> {
         let workers = self.worker_registry.get_all();
         if workers.is_empty() {
             Err("No workers are available".to_string())
         } else {
-            Ok(workers[0].url().to_string())
+            Ok(workers[0].base_url().to_string())
         }
     }
 
@@ -1918,6 +1921,24 @@ mod tests {
         let url = result.unwrap();
         // DashMap doesn't guarantee order, so just check we get one of the workers
         assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
+    }
+
+    #[test]
+    fn test_select_first_worker_uses_the_dp_worker_origin() {
+        let router = create_test_regular_router();
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(Arc::new(DPAwareWorker::new(
+            "http://dp-host:8000".to_string(),
+            3,
+            8,
+            WorkerType::Regular,
+        )));
+        let router = Router {
+            worker_registry: registry,
+            intra_node_data_parallel_size: 8,
+            ..router
+        };
+        assert_eq!(router.select_first_worker().unwrap(), "http://dp-host:8000");
     }
 
     #[tokio::test]
