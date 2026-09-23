@@ -138,6 +138,17 @@ impl PolicyRegistry {
     }
 
     /// Get the default policy
+    /// Release session ownership in the default and every per-model policy.
+    pub fn release_session_owners(&self) -> usize {
+        let mut released = self.get_default_policy().release_session_owners();
+        for policy in self.model_policies.read().unwrap().values() {
+            if !Arc::ptr_eq(policy, &self.get_default_policy()) {
+                released += policy.release_session_owners();
+            }
+        }
+        released
+    }
+
     pub fn get_default_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
         Arc::clone(&self.default_policy)
     }
