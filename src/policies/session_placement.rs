@@ -4,16 +4,20 @@
 //! for the first time is placed on the healthy worker whose sessions hold the
 //! fewest context tokens, instead of the worker the hash ring names. Later
 //! requests of that session stay on the same worker for prefix-cache reuse.
-//! Every request updates its session's context length. A session idle for
-//! `VLLM_ROUTER_SESSION_IDLE_SECS` (default 900) stops counting toward its
-//! worker's load; its stickiness is forgotten after four idle periods.
+//! Every request updates its session's context length. A routed request holds a
+//! [`SessionLease`] until it settles (response fully sent, failed or dropped);
+//! a session with a request in flight never expires, so a long generation keeps
+//! counting and its abort reaches the same worker. Once its last request has
+//! settled, a session idle for `VLLM_ROUTER_SESSION_IDLE_SECS` (default 900)
+//! stops counting toward its worker's load, and its stickiness is forgotten
+//! after four idle periods.
 //!
 //! Context length is the number of `prompt_ids` in the body when present;
 //! otherwise it is estimated as body bytes / 4 and only ever grows, so an
 //! abort-shaped body neither moves nor shrinks a session.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const PLACEMENT_ENV: &str = "VLLM_ROUTER_SESSION_PLACEMENT";
@@ -26,8 +30,10 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 struct Session {
     worker: String,
     tokens: u64,
+    /// Last placement or settle; idle time only runs while `inflight` is zero.
     last_seen: Instant,
     counted: bool,
+    inflight: u32,
 }
 
 /// Ordered by tokens first, then by session count as the tie-break.
@@ -61,6 +67,20 @@ impl State {
             load.tokens = load.tokens.saturating_sub(session.tokens);
             load.sessions = load.sessions.saturating_sub(1);
         }
+    }
+}
+
+/// Keeps a session's owner while one routed request is in flight; dropping it
+/// settles the request and starts the session's idle clock.
+#[derive(Debug)]
+pub struct SessionLease {
+    placement: Arc<TokenPlacement>,
+    key: String,
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        self.placement.settle_at(&self.key, Instant::now());
     }
 }
 
@@ -106,7 +126,8 @@ impl TokenPlacement {
     /// Return the worker for session `key`. A new session, or one whose worker
     /// left `healthy`, goes to the healthy worker with the fewest counted
     /// context tokens (then fewest sessions, then the earliest in `healthy`).
-    /// `healthy` must not be empty.
+    /// `healthy` must not be empty. Call [`TokenPlacement::lease`] right after
+    /// and hold the lease until the routed request settles.
     pub fn place(&self, key: &str, request_text: Option<&str>, healthy: &[&str]) -> String {
         self.place_at(key, request_text, healthy, Instant::now())
     }
@@ -127,23 +148,23 @@ impl TokenPlacement {
             .sessions
             .get(key)
             .is_some_and(|session| !healthy.contains(&session.worker.as_str()));
-        if owner_gone {
+        if owner_gone || !state.sessions.contains_key(key) {
+            // Re-placing an existing session keeps its in-flight count, so its
+            // outstanding leases still settle against it.
             state.set_counted(key, false);
-            state.sessions.remove(key);
-        }
-        if !state.sessions.contains_key(key) {
             let worker = healthy
                 .iter()
                 .min_by_key(|worker| state.loads.get(**worker).copied().unwrap_or_default())
                 .expect("placement requires at least one healthy worker")
                 .to_string();
-            let session = Session {
-                worker,
+            let session = state.sessions.entry(key.to_string()).or_insert(Session {
+                worker: String::new(),
                 tokens: 0,
                 last_seen: now,
                 counted: false,
-            };
-            state.sessions.insert(key.to_string(), session);
+                inflight: 0,
+            });
+            session.worker = worker;
         }
 
         state.set_counted(key, false);
@@ -155,6 +176,31 @@ impl TokenPlacement {
         worker
     }
 
+    /// Mark one request of `key` in flight; `None` when `key` was never placed.
+    pub fn lease(self: &Arc<Self>, key: &str) -> Option<SessionLease> {
+        self.lease_at(key, Instant::now())
+    }
+
+    fn lease_at(self: &Arc<Self>, key: &str, now: Instant) -> Option<SessionLease> {
+        let mut state = self.state.lock().unwrap();
+        let session = state.sessions.get_mut(key)?;
+        session.inflight += 1;
+        session.last_seen = now;
+        state.set_counted(key, true);
+        Some(SessionLease {
+            placement: Arc::clone(self),
+            key: key.to_string(),
+        })
+    }
+
+    fn settle_at(&self, key: &str, now: Instant) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(session) = state.sessions.get_mut(key) {
+            session.inflight = session.inflight.saturating_sub(1);
+            session.last_seen = now;
+        }
+    }
+
     fn sweep(&self, state: &mut State, now: Instant) {
         if now.saturating_duration_since(state.last_sweep) < SWEEP_INTERVAL {
             return;
@@ -164,6 +210,7 @@ impl TokenPlacement {
         let expired: Vec<(String, bool)> = state
             .sessions
             .iter()
+            .filter(|(_, session)| session.inflight == 0)
             .filter_map(|(key, session)| {
                 let age = now.saturating_duration_since(session.last_seen);
                 if age > retain {
@@ -223,6 +270,11 @@ mod tests {
         )
     }
 
+    fn settle(placement: &TokenPlacement, lease: SessionLease, now: Instant) {
+        placement.settle_at(&lease.key, now);
+        std::mem::forget(lease);
+    }
+
     fn tokens_on(placement: &TokenPlacement, worker: &str) -> u64 {
         placement.worker_tokens().get(worker).copied().unwrap_or(0)
     }
@@ -277,6 +329,62 @@ mod tests {
         let forgotten = start + Duration::from_secs(60);
         placement.place_at("u", Some(&body(1)), &workers, forgotten);
         assert_eq!(tokens_on(&placement, "a") + tokens_on(&placement, "b"), 1);
+    }
+
+    #[test]
+    fn a_session_in_flight_never_expires() {
+        let placement = Arc::new(TokenPlacement::new(Duration::from_secs(10)));
+        let workers = ["a", "b"];
+        let start = Instant::now();
+        let owner = placement.place_at("s", Some(&body(80_000)), &workers, start);
+        let generation = placement.lease_at("s", start).unwrap();
+        // A generation far longer than the idle and retention periods keeps counting.
+        let during = start + Duration::from_secs(3_600);
+        placement.place_at("t", Some(&body(10)), &workers, during);
+        assert!(tokens_on(&placement, &owner) >= 80_000);
+        // Its abort, sent after the long gap, reaches the same worker.
+        assert_eq!(
+            placement.place_at("s", Some("{\"request_id\":\"r\"}"), &workers, during),
+            owner
+        );
+        let abort = placement.lease_at("s", during).unwrap();
+        // Settle both at the synthetic clock (dropping a lease settles at the real one).
+        settle(&placement, abort, during);
+        settle(&placement, generation, during + Duration::from_secs(1));
+        // Expiry starts only after the last request settles.
+        let settled = during + Duration::from_secs(1);
+        placement.place_at(
+            "u",
+            Some(&body(1)),
+            &workers,
+            settled + Duration::from_secs(5),
+        );
+        assert!(tokens_on(&placement, &owner) >= 80_000);
+        placement.place_at(
+            "u",
+            Some(&body(1)),
+            &workers,
+            settled + Duration::from_secs(11),
+        );
+        assert!(tokens_on(&placement, &owner) < 80_000);
+    }
+
+    #[test]
+    fn an_abort_after_a_long_gap_keeps_the_owner_until_retention_ends() {
+        let placement = Arc::new(TokenPlacement::new(Duration::from_secs(10)));
+        let workers = ["a", "b"];
+        let start = Instant::now();
+        let owner = placement.place_at("s", Some(&body(500)), &workers, start);
+        settle(&placement, placement.lease_at("s", start).unwrap(), start);
+        // An abort idle past the idle period but inside retention reaches the owner,
+        // even though the owner now carries more load than its peer.
+        placement.place_at("t", Some(&body(10)), &workers, start);
+        let abort = "{\"request_id\":\"r\"}";
+        let gap = start + Duration::from_secs(35);
+        assert_eq!(placement.place_at("s", Some(abort), &workers, gap), owner);
+        let lease = placement.lease_at("s", gap).unwrap();
+        assert_eq!(tokens_on(&placement, &owner), 500);
+        settle(&placement, lease, gap);
     }
 
     #[test]

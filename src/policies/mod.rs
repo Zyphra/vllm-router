@@ -28,7 +28,7 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
-pub use session_placement::TokenPlacement;
+pub use session_placement::{SessionLease, TokenPlacement};
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value
@@ -97,6 +97,17 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// policies to update their internal state.
     fn on_request_complete(&self, _worker_url: &str, _success: bool) {
         // Default: no-op for stateless policies
+    }
+
+    /// Hold the session a request was just routed for until the returned lease is
+    /// dropped. Call right after a selection with the same text and headers, and
+    /// keep the lease until the request settles (response sent, failed or dropped).
+    fn lease_session(
+        &self,
+        _request_text: Option<&str>,
+        _headers: Option<&RequestHeaders>,
+    ) -> Option<SessionLease> {
+        None // Default: the policy keeps no per-session ownership
     }
 
     /// Get policy name for metrics and debugging

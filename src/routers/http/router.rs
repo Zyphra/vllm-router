@@ -5,7 +5,7 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, SessionLease};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
@@ -571,6 +571,11 @@ impl Router {
                     None => self.policy_registry.get_default_policy(),
                 };
 
+                let lease = policy.lease_session(
+                    Some(&text),
+                    Self::headers_to_request_headers(headers).as_ref(),
+                );
+
                 let load_incremented = if policy.name() == "cache_aware" {
                     worker.increment_load();
                     RouterMetrics::set_running_requests(worker.url(), worker.load());
@@ -614,7 +619,14 @@ impl Router {
                     }
                 }
 
-                response
+                match lease {
+                    None => response,
+                    Some(lease) => {
+                        let (parts, body) = response.into_parts();
+                        let stream = hold_lease(body.into_data_stream(), Some(lease));
+                        Response::from_parts(parts, Body::from_stream(stream))
+                    }
+                }
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
@@ -1382,6 +1394,17 @@ impl Router {
 
 use async_trait::async_trait;
 
+/// Keep a session lease until `stream` finishes or is dropped.
+fn hold_lease<S: futures_util::Stream>(
+    stream: S,
+    lease: Option<SessionLease>,
+) -> impl futures_util::Stream<Item = S::Item> {
+    stream.map(move |chunk| {
+        let _held = &lease;
+        chunk
+    })
+}
+
 #[async_trait]
 impl WorkerManagement for Router {
     async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
@@ -1693,6 +1716,11 @@ impl RouterTrait for Router {
             }
         };
 
+        // Hold the session's owner until this request settles, so a long
+        // generation and its abort both reach the worker that owns it.
+        let lease = policy.lease_session(request_text.as_deref(), request_headers.as_ref());
+        drop(request_text);
+
         let worker: &dyn Worker = workers[worker_idx].as_ref();
         let url = worker.endpoint_url(path);
 
@@ -1747,7 +1775,7 @@ impl RouterTrait for Router {
                 let headers = response.headers().clone();
 
                 // Stream the response body
-                let body = Body::from_stream(response.bytes_stream());
+                let body = Body::from_stream(hold_lease(response.bytes_stream(), lease));
                 let mut response_builder = Response::builder().status(status.as_u16());
 
                 for (name, value) in headers.iter() {

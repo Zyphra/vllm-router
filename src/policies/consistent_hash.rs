@@ -14,7 +14,7 @@ use super::get_healthy_worker_indices;
 use super::hash_key;
 use super::LoadBalancingPolicy;
 use super::RequestHeaders;
-use super::TokenPlacement;
+use super::{SessionLease, TokenPlacement};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 
@@ -32,7 +32,7 @@ pub struct ConsistentHashPolicy {
     /// Current set of workers (for detecting changes)
     current_workers: RwLock<Vec<String>>,
     /// Opt-in sticky least-tokens placement of new sessions
-    placement: Option<TokenPlacement>,
+    placement: Option<Arc<TokenPlacement>>,
 }
 
 impl ConsistentHashPolicy {
@@ -45,7 +45,7 @@ impl ConsistentHashPolicy {
         Self {
             hash_ring: RwLock::new(BTreeMap::new()),
             current_workers: RwLock::new(Vec::new()),
-            placement,
+            placement: placement.map(Arc::new),
         }
     }
 
@@ -486,6 +486,19 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
                 Some(fallback_idx)
             }
         }
+    }
+
+    fn lease_session(
+        &self,
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<SessionLease> {
+        let placement = self.placement.as_ref()?;
+        let hash_key = hash_key::extract_hash_key(request_text, headers);
+        if hash_key.starts_with("request") {
+            return None;
+        }
+        placement.lease(&hash_key)
     }
 
     fn name(&self) -> &'static str {
