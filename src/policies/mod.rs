@@ -110,6 +110,13 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         None // Default: the policy keeps no per-session ownership
     }
 
+    /// Forget session ownership because every worker's prefix cache was reset
+    /// (a weight update): sessions are re-placed on their next idle request.
+    /// Returns the number of sessions released.
+    fn release_session_owners(&self) -> usize {
+        0 // Default: the policy keeps no session ownership
+    }
+
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 

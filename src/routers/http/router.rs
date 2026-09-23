@@ -1626,6 +1626,12 @@ impl RouterTrait for Router {
         }
     }
 
+    async fn reset_session_placement(&self) -> Response {
+        let released = self.policy_registry.release_session_owners();
+        info!("Released {} session owners for re-placement", released);
+        Json(serde_json::json!({ "released_sessions": released })).into_response()
+    }
+
     async fn get_worker_loads(&self) -> Response {
         let urls = self.get_worker_urls();
         let mut loads = Vec::new();

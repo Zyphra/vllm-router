@@ -12,6 +12,12 @@
 //! stops counting toward its worker's load, and its stickiness is forgotten
 //! after four idle periods.
 //!
+//! A weight update resets every engine's prefix cache, so stickiness has no
+//! value right after one: [`TokenPlacement::release_owners`] marks every session
+//! for re-placement by the same least-tokens rule on its next request made with
+//! none of its requests in flight. A session with a request in flight keeps its
+//! owner until that request settles, so abort and resume stay consistent.
+//!
 //! Context length is the number of `prompt_ids` in the body when present;
 //! otherwise it is estimated as body bytes / 4 and only ever grows, so an
 //! abort-shaped body neither moves nor shrinks a session.
@@ -34,6 +40,8 @@ struct Session {
     last_seen: Instant,
     counted: bool,
     inflight: u32,
+    /// Set by `release_owners`: re-place on the next request made while idle.
+    released: bool,
 }
 
 /// Ordered by tokens first, then by session count as the tie-break.
@@ -144,10 +152,10 @@ impl TokenPlacement {
         let mut state = self.state.lock().unwrap();
         self.sweep(&mut state, now);
 
-        let owner_gone = state
-            .sessions
-            .get(key)
-            .is_some_and(|session| !healthy.contains(&session.worker.as_str()));
+        let owner_gone = state.sessions.get(key).is_some_and(|session| {
+            !healthy.contains(&session.worker.as_str())
+                || (session.released && session.inflight == 0)
+        });
         if owner_gone || !state.sessions.contains_key(key) {
             // Re-placing an existing session keeps its in-flight count, so its
             // outstanding leases still settle against it.
@@ -163,8 +171,10 @@ impl TokenPlacement {
                 last_seen: now,
                 counted: false,
                 inflight: 0,
+                released: false,
             });
             session.worker = worker;
+            session.released = false;
         }
 
         state.set_counted(key, false);
@@ -174,6 +184,17 @@ impl TokenPlacement {
         let worker = session.worker.clone();
         state.set_counted(key, true);
         worker
+    }
+
+    /// Release every session's owner (the prefix caches were reset): each session
+    /// is re-placed on its next request made with none of its requests in flight.
+    /// Returns the number of sessions released.
+    pub fn release_owners(&self) -> usize {
+        let mut state = self.state.lock().unwrap();
+        for session in state.sessions.values_mut() {
+            session.released = true;
+        }
+        state.sessions.len()
     }
 
     /// Mark one request of `key` in flight; `None` when `key` was never placed.
@@ -385,6 +406,38 @@ mod tests {
         let lease = placement.lease_at("s", gap).unwrap();
         assert_eq!(tokens_on(&placement, &owner), 500);
         settle(&placement, lease, gap);
+    }
+
+    #[test]
+    fn released_sessions_are_re_placed_by_tokens_once_idle() {
+        let placement = Arc::new(TokenPlacement::new(Duration::from_secs(900)));
+        let workers = ["a", "b"];
+        let start = Instant::now();
+        // Two 40k sessions on "a" and "b"; "s" is in flight on its owner.
+        let owner = placement.place_at("s", Some(&body(40_000)), &workers, start);
+        placement.place_at("t", Some(&body(40_000)), &workers, start);
+        let generation = placement.lease_at("s", start).unwrap();
+        // Make the owner the heavier worker so a re-placement would move "s".
+        placement.place_at("u", Some(&body(50_000)), &[owner.as_str()], start);
+        assert_eq!(placement.release_owners(), 3);
+        // In flight: the abort and any resume keep the owner.
+        assert_eq!(
+            placement.place_at("s", Some("{\"request_id\":\"g\"}"), &workers, start),
+            owner
+        );
+        settle(&placement, generation, start);
+        // Idle after the release: the resumed turn goes to the least-token worker.
+        let other = if owner == "a" { "b" } else { "a" };
+        assert_eq!(
+            placement.place_at("s", Some(&body(40_100)), &workers, start),
+            other
+        );
+        // ...and sticks there afterwards.
+        assert_eq!(
+            placement.place_at("s", Some(&body(40_200)), &workers, start),
+            other
+        );
+        assert_eq!(tokens_on(&placement, &owner), 50_000);
     }
 
     #[test]

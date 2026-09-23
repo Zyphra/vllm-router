@@ -152,6 +152,16 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     /// Get worker loads (for monitoring)
     async fn get_worker_loads(&self) -> Response;
 
+    /// Release session ownership after a weight update reset every prefix cache;
+    /// sessions are re-placed on their next request made while idle.
+    async fn reset_session_placement(&self) -> Response {
+        (
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "session placement reset is not supported by this router",
+        )
+            .into_response()
+    }
+
     /// Get router type name
     fn router_type(&self) -> &'static str;
 

@@ -488,6 +488,12 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
         }
     }
 
+    fn release_session_owners(&self) -> usize {
+        self.placement
+            .as_ref()
+            .map_or(0, |placement| placement.release_owners())
+    }
+
     fn lease_session(
         &self,
         request_text: Option<&str>,
