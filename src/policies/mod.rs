@@ -17,6 +17,7 @@ mod random;
 mod registry;
 mod rendezvous_hash;
 mod round_robin;
+mod session_placement;
 
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hash::ConsistentHashPolicy;
@@ -27,6 +28,7 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
+pub use session_placement::TokenPlacement;
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value

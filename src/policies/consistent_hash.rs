@@ -14,6 +14,7 @@ use super::get_healthy_worker_indices;
 use super::hash_key;
 use super::LoadBalancingPolicy;
 use super::RequestHeaders;
+use super::TokenPlacement;
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 
@@ -30,13 +31,21 @@ pub struct ConsistentHashPolicy {
     hash_ring: RwLock<BTreeMap<u64, String>>,
     /// Current set of workers (for detecting changes)
     current_workers: RwLock<Vec<String>>,
+    /// Opt-in sticky least-tokens placement of new sessions
+    placement: Option<TokenPlacement>,
 }
 
 impl ConsistentHashPolicy {
     pub fn new() -> Self {
+        Self::with_placement(TokenPlacement::from_env())
+    }
+
+    /// Build with explicit session placement; `None` is plain consistent hashing.
+    pub fn with_placement(placement: Option<TokenPlacement>) -> Self {
         Self {
             hash_ring: RwLock::new(BTreeMap::new()),
             current_workers: RwLock::new(Vec::new()),
+            placement,
         }
     }
 
@@ -358,6 +367,30 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
         }
         info!("CONSISTENT_HASH_DEBUG: Extracted hash key: {}", hash_key);
 
+        // Session keys go to their sticky worker, or a new session to the healthy
+        // worker holding the fewest context tokens. Keyless requests keep hashing.
+        if let Some(placement) = &self.placement {
+            if !hash_key.starts_with("request") {
+                let healthy: Vec<&str> = healthy_indices
+                    .iter()
+                    .map(|&idx| workers[idx].url())
+                    .collect();
+                let target = placement.place(&hash_key, request_text, &healthy);
+                let idx = healthy_indices
+                    .iter()
+                    .copied()
+                    .find(|&idx| workers[idx].url() == target)?;
+                debug!(
+                    "Session placement: key='{}' -> worker='{}'",
+                    hash_key, target
+                );
+                workers[idx].increment_processed();
+                RouterMetrics::record_processed_request(&target);
+                RouterMetrics::record_policy_decision(self.name(), &target);
+                return Some(idx);
+            }
+        }
+
         // Find target worker using consistent hashing
         let target_worker_url = match self.find_worker_by_hash(&hash_key) {
             Some(url) => {
@@ -550,5 +583,95 @@ mod tests {
         assert_eq!(idx1, idx2);
         assert_eq!(idx2, idx3);
         assert!(idx1.is_some());
+    }
+
+    fn native_body(tokens: usize) -> String {
+        let ids: Vec<String> = (0..tokens).map(|i| (i % 1000).to_string()).collect();
+        format!(
+            "{{\"prompt_ids\":[{}],\"request_id\":\"r\"}}",
+            ids.join(",")
+        )
+    }
+
+    /// Four 80k sessions among 124 of 2k arrive on 8 workers and stay open.
+    /// Sticky least-request placement lands every 80k session on one worker;
+    /// sticky least-token placement spreads them and fills the rest with small ones.
+    #[test]
+    fn test_least_tokens_balances_skewed_context_lengths() {
+        const WORKERS: usize = 8;
+        const LONG: u64 = 80_000;
+        const SMALL: u64 = 2_000;
+        let workers: Vec<Arc<dyn Worker>> = (0..WORKERS)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://worker{i}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let sessions: Vec<u64> = (0..128)
+            .map(|i| if i % 32 == 0 { LONG } else { SMALL })
+            .collect();
+        let total: u64 = sessions.iter().sum();
+        let mean = total / WORKERS as u64;
+
+        // Request-count placement (the stock veRL balancer): least in-flight sessions.
+        let mut counts = [0u64; WORKERS];
+        let mut by_count = [0u64; WORKERS];
+        for &tokens in &sessions {
+            let idx = (0..WORKERS).min_by_key(|&i| counts[i]).unwrap();
+            counts[idx] += 1;
+            by_count[idx] += tokens;
+        }
+
+        let route = |policy: &ConsistentHashPolicy| {
+            let mut placed = [0u64; WORKERS];
+            let mut long = [0u32; WORKERS];
+            for (i, &tokens) in sessions.iter().enumerate() {
+                let headers: RequestHeaders =
+                    [("x-session-id".to_string(), format!("episode-{i}"))].into();
+                let body = native_body(tokens as usize);
+                let idx = policy
+                    .select_worker_with_headers(&workers, Some(&body), Some(&headers))
+                    .unwrap();
+                // A later turn of the same session stays on its worker.
+                let again = policy
+                    .select_worker_with_headers(&workers, Some(&body), Some(&headers))
+                    .unwrap();
+                assert_eq!(idx, again, "session episode-{i} moved");
+                placed[idx] += tokens;
+                long[idx] += u32::from(tokens == LONG);
+            }
+            (placed, long)
+        };
+        let (by_hash, _) = route(&ConsistentHashPolicy::with_placement(None));
+        let (by_tokens, long_by_tokens) = route(&ConsistentHashPolicy::with_placement(Some(
+            TokenPlacement::new(std::time::Duration::from_secs(900)),
+        )));
+
+        let max = |loads: &[u64; WORKERS]| *loads.iter().max().unwrap();
+        println!("mean={mean} count={by_count:?} hash={by_hash:?} tokens={by_tokens:?}");
+        assert_eq!(by_count.iter().sum::<u64>(), total);
+        assert_eq!(by_tokens.iter().sum::<u64>(), total);
+        assert!(
+            max(&by_count) >= 4 * LONG,
+            "count placement stacks the 80k sessions"
+        );
+        // Least-tokens never stacks two 80k sessions, meets the greedy bound
+        // (mean + largest session) and beats both count and hash placement.
+        assert!(long_by_tokens.iter().all(|&n| n <= 1), "{long_by_tokens:?}");
+        assert!(max(&by_tokens) <= mean + LONG, "{by_tokens:?}");
+        assert!(
+            2 * max(&by_tokens) < max(&by_count),
+            "{by_tokens:?} vs {by_count:?}"
+        );
+        assert!(
+            max(&by_tokens) < max(&by_hash),
+            "{by_tokens:?} vs {by_hash:?}"
+        );
+        assert!(
+            *by_tokens.iter().min().unwrap() >= mean / 2,
+            "{by_tokens:?}"
+        );
     }
 }
