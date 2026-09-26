@@ -4,6 +4,10 @@
 //! for the first time is placed on the healthy worker whose sessions hold the
 //! fewest context tokens, instead of the worker the hash ring names. Later
 //! requests of that session stay on the same worker for prefix-cache reuse.
+//! `least_sessions` places by the fewest counted sessions instead, with tokens
+//! as the tie-break: for engines whose sequence cap binds before their KV cache,
+//! least tokens puts many short sessions on one worker and few long ones on
+//! another, so the first queues while the second drains.
 //! Every request updates its session's context length. A routed request holds a
 //! [`SessionLease`] until it settles (response fully sent, failed or dropped);
 //! a session with a request in flight never expires, so a long generation keeps
@@ -44,11 +48,28 @@ struct Session {
     released: bool,
 }
 
-/// Ordered by tokens first, then by session count as the tie-break.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Load {
     tokens: u64,
     sessions: u64,
+}
+
+/// Which load a new or released session is balanced on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Balance {
+    /// Fewest counted context tokens, then fewest sessions.
+    Tokens,
+    /// Fewest counted sessions, then fewest context tokens.
+    Sessions,
+}
+
+impl Balance {
+    fn key(self, load: Load) -> (u64, u64) {
+        match self {
+            Balance::Tokens => (load.tokens, load.sessions),
+            Balance::Sessions => (load.sessions, load.tokens),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -92,17 +113,24 @@ impl Drop for SessionLease {
     }
 }
 
-/// Sticky least-tokens session placement shared by all requests of one Router.
+/// Sticky least-load session placement shared by all requests of one Router.
 #[derive(Debug)]
 pub struct TokenPlacement {
     idle: Duration,
+    balance: Balance,
     state: Mutex<State>,
 }
 
 impl TokenPlacement {
+    /// Least-tokens placement.
     pub fn new(idle: Duration) -> Self {
+        Self::with_balance(idle, Balance::Tokens)
+    }
+
+    pub fn with_balance(idle: Duration, balance: Balance) -> Self {
         Self {
             idle,
+            balance,
             state: Mutex::new(State {
                 sessions: HashMap::new(),
                 loads: HashMap::new(),
@@ -113,27 +141,27 @@ impl TokenPlacement {
 
     /// Build from the environment; `None` keeps plain consistent hashing.
     pub fn from_env() -> Option<Self> {
-        match std::env::var(PLACEMENT_ENV).ok().as_deref() {
-            None | Some("") | Some("hash") => None,
-            Some("least_tokens") => {
-                let idle = match std::env::var(IDLE_SECS_ENV).ok().as_deref() {
-                    None | Some("") => DEFAULT_IDLE_SECS,
-                    Some(value) => match value.parse::<u64>() {
-                        Ok(secs) if secs > 0 => secs,
-                        _ => panic!("{IDLE_SECS_ENV} must be a positive integer, got {value:?}"),
-                    },
-                };
-                Some(Self::new(Duration::from_secs(idle)))
-            }
-            Some(other) => {
-                panic!("{PLACEMENT_ENV} must be 'hash' or 'least_tokens', got {other:?}")
-            }
-        }
+        let balance = match std::env::var(PLACEMENT_ENV).ok().as_deref() {
+            None | Some("") | Some("hash") => return None,
+            Some("least_tokens") => Balance::Tokens,
+            Some("least_sessions") => Balance::Sessions,
+            Some(other) => panic!(
+                "{PLACEMENT_ENV} must be 'hash', 'least_tokens' or 'least_sessions', got {other:?}"
+            ),
+        };
+        let idle = match std::env::var(IDLE_SECS_ENV).ok().as_deref() {
+            None | Some("") => DEFAULT_IDLE_SECS,
+            Some(value) => match value.parse::<u64>() {
+                Ok(secs) if secs > 0 => secs,
+                _ => panic!("{IDLE_SECS_ENV} must be a positive integer, got {value:?}"),
+            },
+        };
+        Some(Self::with_balance(Duration::from_secs(idle), balance))
     }
 
     /// Return the worker for session `key`. A new session, or one whose worker
-    /// left `healthy`, goes to the healthy worker with the fewest counted
-    /// context tokens (then fewest sessions, then the earliest in `healthy`).
+    /// left `healthy`, goes to the healthy worker with the least counted load
+    /// by this placement's [`Balance`] (then the earliest in `healthy`).
     /// `healthy` must not be empty. Call [`TokenPlacement::lease`] right after
     /// and hold the lease until the routed request settles.
     pub fn place(&self, key: &str, request_text: Option<&str>, healthy: &[&str]) -> String {
@@ -162,7 +190,10 @@ impl TokenPlacement {
             state.set_counted(key, false);
             let worker = healthy
                 .iter()
-                .min_by_key(|worker| state.loads.get(**worker).copied().unwrap_or_default())
+                .min_by_key(|worker| {
+                    self.balance
+                        .key(state.loads.get(**worker).copied().unwrap_or_default())
+                })
                 .expect("placement requires at least one healthy worker")
                 .to_string();
             let session = state.sessions.entry(key.to_string()).or_insert(Session {
@@ -187,7 +218,8 @@ impl TokenPlacement {
     }
 
     /// Release every session's owner (the prefix caches were reset): each session
-    /// is re-placed on its next request made with none of its requests in flight.
+    /// is re-placed by the same balance on its next request made with none of its
+    /// requests in flight.
     /// Returns the number of sessions released.
     pub fn release_owners(&self) -> usize {
         let mut state = self.state.lock().unwrap();
@@ -249,6 +281,16 @@ impl TokenPlacement {
                 state.sessions.remove(&key);
             }
         }
+    }
+
+    /// Counted sessions per worker, for diagnostics and tests.
+    pub fn worker_sessions(&self) -> HashMap<String, u64> {
+        let state = self.state.lock().unwrap();
+        state
+            .loads
+            .iter()
+            .map(|(worker, load)| (worker.clone(), load.sessions))
+            .collect()
     }
 
     /// Counted context tokens per worker, for diagnostics and tests.
@@ -438,6 +480,77 @@ mod tests {
             other
         );
         assert_eq!(tokens_on(&placement, &owner), 50_000);
+    }
+
+    /// One 80k session per worker, then 64 new 2k sessions on 4 workers. Least
+    /// tokens gives each new session to whichever worker is lightest in tokens,
+    /// so the counts stay skewed while any 80k session is open; least sessions
+    /// gives every worker 17 and still never exceeds a sequence cap.
+    #[test]
+    fn least_sessions_evens_session_counts_under_skewed_contexts() {
+        let workers = ["a", "b", "c", "d"];
+        let place_all = |placement: &TokenPlacement| {
+            // "a" holds a long session; "b".."d" hold short ones.
+            placement.place("long", Some(&body(80_000)), &["a"]);
+            for (i, worker) in ["b", "c", "d"].iter().enumerate() {
+                placement.place(&format!("short-{i}"), Some(&body(2_000)), &[*worker]);
+            }
+            for i in 0..64 {
+                placement.place(&format!("new-{i}"), Some(&body(2_000)), &workers);
+            }
+            workers.map(|worker| {
+                placement
+                    .worker_sessions()
+                    .get(worker)
+                    .copied()
+                    .unwrap_or(0)
+            })
+        };
+        let by_tokens = place_all(&TokenPlacement::new(Duration::from_secs(900)));
+        let by_sessions = place_all(&TokenPlacement::with_balance(
+            Duration::from_secs(900),
+            Balance::Sessions,
+        ));
+        assert_eq!(by_tokens.iter().sum::<u64>(), 68);
+        assert_eq!(by_sessions.iter().sum::<u64>(), 68);
+        // Least tokens starves the worker holding the long session.
+        assert_eq!(by_tokens[0], 1, "{by_tokens:?}");
+        assert!(by_tokens[1..].iter().all(|&n| n >= 22), "{by_tokens:?}");
+        assert_eq!(by_sessions, [17, 17, 17, 17]);
+    }
+
+    #[test]
+    fn least_sessions_breaks_count_ties_by_tokens() {
+        let placement = TokenPlacement::with_balance(Duration::from_secs(900), Balance::Sessions);
+        let workers = ["a", "b"];
+        placement.place("big", Some(&body(50_000)), &["a"]);
+        placement.place("small", Some(&body(1_000)), &["b"]);
+        // Equal counts: the new session goes to the worker with fewer tokens.
+        assert_eq!(placement.place("next", Some(&body(10)), &workers), "b");
+        // Now "b" holds more sessions, so the next one goes to "a" despite its tokens.
+        assert_eq!(placement.place("after", Some(&body(10)), &workers), "a");
+    }
+
+    #[test]
+    fn released_sessions_are_re_placed_by_sessions_once_idle() {
+        let placement = Arc::new(TokenPlacement::with_balance(
+            Duration::from_secs(900),
+            Balance::Sessions,
+        ));
+        let start = Instant::now();
+        // Three sessions on "a", one heavier session on "b".
+        for key in ["s", "t", "u"] {
+            placement.place_at(key, Some(&body(1_000)), &["a"], start);
+        }
+        placement.place_at("v", Some(&body(90_000)), &["b"], start);
+        assert_eq!(placement.release_owners(), 4);
+        // Idle after the release: "s" moves to the worker with fewer sessions.
+        assert_eq!(
+            placement.place_at("s", Some(&body(1_100)), &["a", "b"], start),
+            "b"
+        );
+        assert_eq!(placement.worker_sessions()["a"], 2);
+        assert_eq!(placement.worker_sessions()["b"], 2);
     }
 
     #[test]
