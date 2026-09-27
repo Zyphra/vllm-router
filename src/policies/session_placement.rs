@@ -1,9 +1,19 @@
-//! Token-aware placement of new sessions for the consistent hash policy.
+//! Sticky placement of new sessions for the consistent hash policy.
 //!
-//! Opt-in with `VLLM_ROUTER_SESSION_PLACEMENT=least_tokens`. A session key seen
-//! for the first time is placed on the healthy worker whose sessions hold the
-//! fewest context tokens, instead of the worker the hash ring names. Later
-//! requests of that session stay on the same worker for prefix-cache reuse.
+//! Opt-in with `VLLM_ROUTER_SESSION_PLACEMENT=least_tokens` or `least_inflight`.
+//! A session key seen for the first time is placed on a healthy worker chosen by
+//! load instead of the worker the hash ring names. Later requests of that
+//! session stay on the same worker for prefix-cache reuse.
+//!
+//! - `least_tokens`: the worker whose sessions hold the fewest context tokens.
+//! - `least_inflight`: the worker with the fewest routed requests in flight, then
+//!   the fewest counted sessions, then the fewest tokens (veRL's default rule:
+//!   first turn to the least in-flight server, later turns sticky). A placement
+//!   counts its request in flight under the same lock, so a burst sees its own
+//!   placements; the request's lease, taken right after, settles it. Every
+//!   keyed request the regular Router places is leased; a caller that places
+//!   without leasing (prefill/decode routing) must not use this rule.
+//!
 //! Every request updates its session's context length. A routed request holds a
 //! [`SessionLease`] until it settles (response fully sent, failed or dropped);
 //! a session with a request in flight never expires, so a long generation keeps
@@ -44,11 +54,31 @@ struct Session {
     released: bool,
 }
 
-/// Ordered by tokens first, then by session count as the tie-break.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// How a new or released session picks its worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementRule {
+    /// Fewest counted context tokens, then fewest counted sessions.
+    LeastTokens,
+    /// Fewest requests in flight, then fewest counted sessions, then tokens.
+    LeastInflight,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Load {
     tokens: u64,
     sessions: u64,
+    /// Routed requests not yet settled: the sum of `Session::inflight` over the
+    /// sessions this worker owns.
+    inflight: u64,
+}
+
+impl Load {
+    fn rank(&self, rule: PlacementRule) -> (u64, u64, u64) {
+        match rule {
+            PlacementRule::LeastTokens => (self.tokens, self.sessions, 0),
+            PlacementRule::LeastInflight => (self.inflight, self.sessions, self.tokens),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -76,6 +106,32 @@ impl State {
             load.sessions = load.sessions.saturating_sub(1);
         }
     }
+
+    /// Count one more request of `key` in flight on its worker.
+    fn begin_request(&mut self, key: &str) {
+        let Some(session) = self.sessions.get_mut(key) else {
+            return;
+        };
+        session.inflight += 1;
+        self.loads
+            .entry(session.worker.clone())
+            .or_default()
+            .inflight += 1;
+    }
+
+    /// Settle one request of `key` (completed, failed, aborted or dropped).
+    fn end_request(&mut self, key: &str) {
+        let Some(session) = self.sessions.get_mut(key) else {
+            return;
+        };
+        if session.inflight == 0 {
+            return;
+        }
+        session.inflight -= 1;
+        if let Some(load) = self.loads.get_mut(&session.worker) {
+            load.inflight = load.inflight.saturating_sub(1);
+        }
+    }
 }
 
 /// Keeps a session's owner while one routed request is in flight; dropping it
@@ -92,16 +148,23 @@ impl Drop for SessionLease {
     }
 }
 
-/// Sticky least-tokens session placement shared by all requests of one Router.
+/// Sticky session placement shared by all requests of one Router.
 #[derive(Debug)]
 pub struct TokenPlacement {
+    rule: PlacementRule,
     idle: Duration,
     state: Mutex<State>,
 }
 
 impl TokenPlacement {
+    /// Least-tokens placement.
     pub fn new(idle: Duration) -> Self {
+        Self::with_rule(PlacementRule::LeastTokens, idle)
+    }
+
+    pub fn with_rule(rule: PlacementRule, idle: Duration) -> Self {
         Self {
+            rule,
             idle,
             state: Mutex::new(State {
                 sessions: HashMap::new(),
@@ -113,29 +176,30 @@ impl TokenPlacement {
 
     /// Build from the environment; `None` keeps plain consistent hashing.
     pub fn from_env() -> Option<Self> {
-        match std::env::var(PLACEMENT_ENV).ok().as_deref() {
-            None | Some("") | Some("hash") => None,
-            Some("least_tokens") => {
-                let idle = match std::env::var(IDLE_SECS_ENV).ok().as_deref() {
-                    None | Some("") => DEFAULT_IDLE_SECS,
-                    Some(value) => match value.parse::<u64>() {
-                        Ok(secs) if secs > 0 => secs,
-                        _ => panic!("{IDLE_SECS_ENV} must be a positive integer, got {value:?}"),
-                    },
-                };
-                Some(Self::new(Duration::from_secs(idle)))
-            }
-            Some(other) => {
-                panic!("{PLACEMENT_ENV} must be 'hash' or 'least_tokens', got {other:?}")
-            }
-        }
+        let rule = match std::env::var(PLACEMENT_ENV).ok().as_deref() {
+            None | Some("") | Some("hash") => return None,
+            Some("least_tokens") => PlacementRule::LeastTokens,
+            Some("least_inflight") => PlacementRule::LeastInflight,
+            Some(other) => panic!(
+                "{PLACEMENT_ENV} must be 'hash', 'least_tokens' or 'least_inflight', got {other:?}"
+            ),
+        };
+        let idle = match std::env::var(IDLE_SECS_ENV).ok().as_deref() {
+            None | Some("") => DEFAULT_IDLE_SECS,
+            Some(value) => match value.parse::<u64>() {
+                Ok(secs) if secs > 0 => secs,
+                _ => panic!("{IDLE_SECS_ENV} must be a positive integer, got {value:?}"),
+            },
+        };
+        Some(Self::with_rule(rule, Duration::from_secs(idle)))
     }
 
     /// Return the worker for session `key`. A new session, or one whose worker
-    /// left `healthy`, goes to the healthy worker with the fewest counted
-    /// context tokens (then fewest sessions, then the earliest in `healthy`).
-    /// `healthy` must not be empty. Call [`TokenPlacement::lease`] right after
-    /// and hold the lease until the routed request settles.
+    /// left `healthy`, goes to the healthy worker ranked lowest by the rule
+    /// (ties to the earliest in `healthy`). `healthy` must not be empty. Call
+    /// [`TokenPlacement::lease`] right after and hold the lease until the routed
+    /// request settles; under `least_inflight` the placement has already
+    /// counted that request in flight and the lease settles it.
     pub fn place(&self, key: &str, request_text: Option<&str>, healthy: &[&str]) -> String {
         self.place_at(key, request_text, healthy, Instant::now())
     }
@@ -158,11 +222,14 @@ impl TokenPlacement {
         });
         if owner_gone || !state.sessions.contains_key(key) {
             // Re-placing an existing session keeps its in-flight count, so its
-            // outstanding leases still settle against it.
+            // outstanding leases still settle against it; the count moves with it.
             state.set_counted(key, false);
             let worker = healthy
                 .iter()
-                .min_by_key(|worker| state.loads.get(**worker).copied().unwrap_or_default())
+                .min_by_key(|worker| {
+                    let load = state.loads.get(**worker).copied().unwrap_or_default();
+                    load.rank(self.rule)
+                })
                 .expect("placement requires at least one healthy worker")
                 .to_string();
             let session = state.sessions.entry(key.to_string()).or_insert(Session {
@@ -173,8 +240,14 @@ impl TokenPlacement {
                 inflight: 0,
                 released: false,
             });
-            session.worker = worker;
+            let previous = std::mem::replace(&mut session.worker, worker.clone());
+            let inflight = u64::from(session.inflight);
             session.released = false;
+            if inflight > 0 {
+                let load = state.loads.entry(previous).or_default();
+                load.inflight = load.inflight.saturating_sub(inflight);
+                state.loads.entry(worker).or_default().inflight += inflight;
+            }
         }
 
         state.set_counted(key, false);
@@ -183,6 +256,9 @@ impl TokenPlacement {
         session.last_seen = now;
         let worker = session.worker.clone();
         state.set_counted(key, true);
+        if self.rule == PlacementRule::LeastInflight {
+            state.begin_request(key);
+        }
         worker
     }
 
@@ -205,8 +281,10 @@ impl TokenPlacement {
     fn lease_at(self: &Arc<Self>, key: &str, now: Instant) -> Option<SessionLease> {
         let mut state = self.state.lock().unwrap();
         let session = state.sessions.get_mut(key)?;
-        session.inflight += 1;
         session.last_seen = now;
+        if self.rule != PlacementRule::LeastInflight {
+            state.begin_request(key);
+        }
         state.set_counted(key, true);
         Some(SessionLease {
             placement: Arc::clone(self),
@@ -216,8 +294,8 @@ impl TokenPlacement {
 
     fn settle_at(&self, key: &str, now: Instant) {
         let mut state = self.state.lock().unwrap();
+        state.end_request(key);
         if let Some(session) = state.sessions.get_mut(key) {
-            session.inflight = session.inflight.saturating_sub(1);
             session.last_seen = now;
         }
     }
@@ -258,6 +336,16 @@ impl TokenPlacement {
             .loads
             .iter()
             .map(|(worker, load)| (worker.clone(), load.tokens))
+            .collect()
+    }
+
+    /// Routed requests in flight per worker, for diagnostics and tests.
+    pub fn worker_inflight(&self) -> HashMap<String, u64> {
+        let state = self.state.lock().unwrap();
+        state
+            .loads
+            .iter()
+            .map(|(worker, load)| (worker.clone(), load.inflight))
             .collect()
     }
 }
@@ -438,6 +526,195 @@ mod tests {
             other
         );
         assert_eq!(tokens_on(&placement, &owner), 50_000);
+    }
+
+    fn inflight_on(placement: &TokenPlacement, worker: &str) -> u64 {
+        placement
+            .worker_inflight()
+            .get(worker)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn least_inflight() -> Arc<TokenPlacement> {
+        Arc::new(TokenPlacement::with_rule(
+            PlacementRule::LeastInflight,
+            Duration::from_secs(900),
+        ))
+    }
+
+    /// Place and lease one request, as the Router does for every keyed request.
+    fn dispatch(
+        placement: &Arc<TokenPlacement>,
+        key: &str,
+        text: &str,
+        healthy: &[&str],
+        now: Instant,
+    ) -> (String, SessionLease) {
+        let worker = placement.place_at(key, Some(text), healthy, now);
+        (worker, placement.lease_at(key, now).unwrap())
+    }
+
+    /// veRL's rule: a new session goes to the worker with the fewest requests
+    /// in flight, and every later turn sticks to it.
+    #[test]
+    fn least_inflight_places_new_sessions_on_the_least_busy_worker() {
+        let placement = least_inflight();
+        let workers = ["a", "b", "c"];
+        let now = Instant::now();
+        let mut leases = Vec::new();
+        let (heavy, lease) = dispatch(&placement, "heavy", &body(10), &workers, now);
+        leases.push(lease);
+        for turn in 0..2 {
+            let (worker, lease) = dispatch(&placement, "heavy", &body(20 + turn), &workers, now);
+            assert_eq!(worker, heavy);
+            leases.push(lease);
+        }
+        let (mid, lease) = dispatch(&placement, "mid", &body(10), &workers, now);
+        leases.push(lease);
+        assert_ne!(mid, heavy);
+        assert_eq!(inflight_on(&placement, &heavy), 3);
+        let idle = *workers.iter().find(|w| **w != heavy && **w != mid).unwrap();
+        let (new, lease) = dispatch(&placement, "new", &body(10), &workers, now);
+        assert_eq!(new, idle);
+        leases.push(lease);
+        drop(leases);
+        assert!(placement.worker_inflight().values().all(|&n| n == 0));
+    }
+
+    /// The 103276 shape: half the workers hold only long sessions that are idle
+    /// in tool calls (settled, still counted), the other half run short
+    /// sessions. A burst of new sessions spreads by requests in flight to
+    /// within one request per worker, reaching the idle long-session workers;
+    /// least tokens sends the whole burst to the short-session workers.
+    #[test]
+    fn a_burst_spreads_by_inflight_past_idle_long_sessions() {
+        let names: Vec<String> = (0..8).map(|i| format!("w{i}")).collect();
+        let workers: Vec<&str> = names.iter().map(String::as_str).collect();
+        let run = |rule| {
+            let placement = Arc::new(TokenPlacement::with_rule(rule, Duration::from_secs(900)));
+            let start = Instant::now();
+            let mut leases = Vec::new();
+            for (i, worker) in workers.iter().enumerate() {
+                if i < 4 {
+                    let key = format!("long{i}");
+                    let (_, lease) = dispatch(&placement, &key, &body(100_000), &[*worker], start);
+                    settle(&placement, lease, start);
+                } else {
+                    for j in 0..2 {
+                        let key = format!("short{i}-{j}");
+                        let (_, lease) =
+                            dispatch(&placement, &key, &body(2_000), &[*worker], start);
+                        leases.push(lease);
+                    }
+                }
+            }
+            let burst_at = start + Duration::from_secs(60);
+            let mut burst = vec![0u64; workers.len()];
+            for n in 0..24 {
+                let key = format!("new{n}");
+                let (worker, lease) = dispatch(&placement, &key, &body(3_000), &workers, burst_at);
+                burst[workers.iter().position(|w| *w == worker).unwrap()] += 1;
+                leases.push(lease);
+            }
+            let inflight: Vec<u64> = workers.iter().map(|w| inflight_on(&placement, w)).collect();
+            for lease in leases {
+                settle(&placement, lease, burst_at);
+            }
+            assert!(
+                placement.worker_inflight().values().all(|&n| n == 0),
+                "every settled request leaves the count"
+            );
+            (burst, inflight)
+        };
+        let (burst, inflight) = run(PlacementRule::LeastInflight);
+        let (max, min) = (
+            inflight.iter().max().unwrap(),
+            inflight.iter().min().unwrap(),
+        );
+        assert!(max - min <= 1, "{inflight:?}");
+        assert!(burst[..4].iter().all(|&n| n > 0), "{burst:?}");
+        let (by_tokens, _) = run(PlacementRule::LeastTokens);
+        assert_eq!(by_tokens[..4].iter().sum::<u64>(), 0, "{by_tokens:?}");
+    }
+
+    /// Placement counts the request under the placement lock, so requests
+    /// placed before any of them is leased still see each other.
+    #[test]
+    fn least_inflight_counts_a_request_when_it_is_placed() {
+        let placement = least_inflight();
+        let workers = ["a", "b", "c", "d"];
+        let now = Instant::now();
+        let placed: Vec<String> = (0..4)
+            .map(|n| placement.place_at(&format!("s{n}"), Some(&body(10)), &workers, now))
+            .collect();
+        let mut distinct = placed.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 4, "{placed:?}");
+        let leases: Vec<SessionLease> = (0..4)
+            .map(|n| placement.lease_at(&format!("s{n}"), now).unwrap())
+            .collect();
+        // The lease holds the placement's count instead of adding another.
+        assert!(workers.iter().all(|w| inflight_on(&placement, w) == 1));
+        drop(leases);
+        assert!(workers.iter().all(|w| inflight_on(&placement, w) == 0));
+    }
+
+    /// A generation and its abort both count against the owner while in
+    /// flight: the abort reaches the owner although it is the busier worker,
+    /// and once both settle the owner is the least busy worker again.
+    #[test]
+    fn least_inflight_abort_reaches_the_owner_and_both_settle() {
+        let placement = least_inflight();
+        let workers = ["a", "b"];
+        let now = Instant::now();
+        let (owner, generation) = dispatch(&placement, "s", &body(500), &workers, now);
+        let other = if owner == "a" { "b" } else { "a" };
+        let abort_body = "{\"request_id\":\"r\"}";
+        let (target, abort) = dispatch(&placement, "s", abort_body, &workers, now);
+        assert_eq!(target, owner);
+        assert_eq!(inflight_on(&placement, &owner), 2);
+        drop(abort);
+        assert_eq!(inflight_on(&placement, &owner), 1);
+        // The aborted generation returns, or its client disconnects: its lease drops.
+        drop(generation);
+        assert_eq!(inflight_on(&placement, &owner), 0);
+        // Idle and tied on requests, the next session goes to the worker with fewer sessions.
+        let (first, running) = dispatch(&placement, "t", &body(10), &workers, now);
+        assert_eq!(first, other);
+        let (second, _second) = dispatch(&placement, "u", &body(10), &workers, now);
+        assert_eq!(second, owner);
+        drop(running);
+    }
+
+    /// A weight update keeps an in-flight session on its owner and re-places it
+    /// by requests in flight once idle; a session whose owner leaves the healthy
+    /// set carries its in-flight count, so every lease still settles to zero.
+    #[test]
+    fn least_inflight_re_placement_keeps_the_count_consistent() {
+        let placement = least_inflight();
+        let workers = ["a", "b"];
+        let now = Instant::now();
+        let (owner, generation) = dispatch(&placement, "s", &body(100), &workers, now);
+        let other = if owner == "a" { "b" } else { "a" };
+        let (_, busy) = dispatch(&placement, "u", &body(100), &[owner.as_str()], now);
+        assert_eq!(placement.release_owners(), 2);
+        let abort_body = "{\"request_id\":\"r\"}";
+        let (target, abort) = dispatch(&placement, "s", abort_body, &workers, now);
+        assert_eq!(target, owner);
+        settle(&placement, abort, now);
+        settle(&placement, generation, now);
+        // Idle after the release: the resumed turn goes to the worker with fewer in flight.
+        let (moved, resumed) = dispatch(&placement, "s", &body(150), &workers, now);
+        assert_eq!(moved, other);
+        // Its new owner fails with the turn in flight: the count moves with the session.
+        let (back, retry) = dispatch(&placement, "s", &body(150), &[owner.as_str()], now);
+        assert_eq!(back, owner);
+        assert_eq!(inflight_on(&placement, other), 0);
+        assert_eq!(inflight_on(&placement, &owner), 3);
+        drop((busy, resumed, retry));
+        assert!(placement.worker_inflight().values().all(|&n| n == 0));
     }
 
     #[test]

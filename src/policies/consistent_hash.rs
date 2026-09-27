@@ -31,7 +31,7 @@ pub struct ConsistentHashPolicy {
     hash_ring: RwLock<BTreeMap<u64, String>>,
     /// Current set of workers (for detecting changes)
     current_workers: RwLock<Vec<String>>,
-    /// Opt-in sticky least-tokens placement of new sessions
+    /// Opt-in sticky placement of new sessions by load
     placement: Option<Arc<TokenPlacement>>,
 }
 
@@ -367,8 +367,8 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
         }
         info!("CONSISTENT_HASH_DEBUG: Extracted hash key: {}", hash_key);
 
-        // Session keys go to their sticky worker, or a new session to the healthy
-        // worker holding the fewest context tokens. Keyless requests keep hashing.
+        // Session keys go to their sticky worker, or a new session to the least
+        // loaded healthy worker. Keyless requests keep hashing.
         if let Some(placement) = &self.placement {
             if !hash_key.starts_with("request") {
                 let healthy: Vec<&str> = healthy_indices
