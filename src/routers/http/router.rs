@@ -1630,6 +1630,17 @@ impl RouterTrait for Router {
         }
     }
 
+    async fn session_placement(&self) -> Response {
+        match self
+            .policy_registry
+            .get_default_policy()
+            .session_placement()
+        {
+            Some(snapshot) => Json(snapshot).into_response(),
+            None => (StatusCode::NOT_FOUND, "session placement is off").into_response(),
+        }
+    }
+
     async fn reset_session_placement(&self) -> Response {
         let released = self.policy_registry.release_session_owners();
         info!("Released {} session owners for re-placement", released);
@@ -1919,6 +1930,152 @@ mod tests {
             assert!(detail.contains("test-session"), "{detail}");
             assert!(detail.contains(&url), "{detail}");
             assert!(!detail.contains("prompt-must-not-be-logged"), "{detail}");
+        }
+    }
+
+    /// Least in-flight placement on the real `/verl/v1/generate` route: a
+    /// request counts on its worker from dispatch until its response settles,
+    /// whether it completes, is aborted through `/verl/v1/abort`, or its client
+    /// drops the response.
+    #[tokio::test]
+    async fn test_least_inflight_counts_generate_until_it_completes_or_aborts() {
+        use crate::policies::{ConsistentHashPolicy, PlacementRule, TokenPlacement};
+        use axum::extract::State;
+        use axum::routing::post;
+        use std::sync::Mutex;
+        use tokio::sync::Notify;
+
+        type Seen = Arc<Mutex<Vec<(String, String, String)>>>;
+        #[derive(Clone)]
+        struct Backend {
+            url: String,
+            seen: Seen,
+            abort: Arc<Notify>,
+        }
+        fn record(backend: &Backend, path: &str, body: &serde_json::Value) {
+            let request = body["request_id"].as_str().unwrap().to_string();
+            let entry = (backend.url.clone(), path.to_string(), request);
+            backend.seen.lock().unwrap().push(entry);
+        }
+        async fn generate(
+            State(backend): State<Backend>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Response {
+            record(&backend, "/verl/v1/generate", &body);
+            if body["hold"] != true {
+                return Json(serde_json::json!({"done": true})).into_response();
+            }
+            // Stream until an abort for this engine arrives, as vLLM does.
+            let abort = backend.abort.clone();
+            let chunks = futures_util::stream::iter([Ok::<_, std::io::Error>("started")]).chain(
+                futures_util::stream::once(async move {
+                    abort.notified().await;
+                    Ok("aborted")
+                }),
+            );
+            Body::from_stream(chunks).into_response()
+        }
+        async fn abort(
+            State(backend): State<Backend>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Response {
+            record(&backend, "/verl/v1/abort", &body);
+            backend.abort.notify_one();
+            Json(serde_json::json!({"aborted": true})).into_response()
+        }
+
+        let seen: Seen = Arc::default();
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        for _ in 0..2 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let backend = Backend {
+                url: url.clone(),
+                seen: seen.clone(),
+                abort: Arc::default(),
+            };
+            let app = axum::Router::new()
+                .route("/verl/v1/generate", post(generate))
+                .route("/verl/v1/abort", post(abort))
+                .with_state(backend);
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            router
+                .worker_registry
+                .register(Arc::new(BasicWorker::new(url, WorkerType::Regular)));
+        }
+        router.policy_registry = Arc::new(PolicyRegistry::with_default_policy(Arc::new(
+            ConsistentHashPolicy::with_placement(Some(TokenPlacement::with_rule(
+                PlacementRule::LeastInflight,
+                Duration::from_secs(900),
+            ))),
+        )));
+        router.client = Client::builder().no_proxy().build().unwrap();
+
+        // Each request's id is its session key, which the backend records.
+        let send = |session: &'static str, path: &'static str, mut body: serde_json::Value| {
+            let router = &router;
+            let seen = seen.clone();
+            body["request_id"] = session.into();
+            async move {
+                let mut headers = HeaderMap::new();
+                headers.insert("x-session-id", HeaderValue::from_static(session));
+                let response = router
+                    .route_transparent(Some(&headers), path, &Method::POST, body)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let (worker, routed, key) = seen.lock().unwrap().last().cloned().unwrap();
+                assert_eq!((routed.as_str(), key.as_str()), (path, session));
+                (worker, response)
+            }
+        };
+        let generate_body = |tokens: usize, hold: bool| serde_json::json!({"prompt_ids": vec![1; tokens], "hold": hold});
+
+        // Two generations in flight take the two engines.
+        let (long, long_response) =
+            send("long", "/verl/v1/generate", generate_body(10_000, true)).await;
+        let (short, short_response) =
+            send("short", "/verl/v1/generate", generate_body(10, true)).await;
+        assert_ne!(long, short);
+
+        // The abort reaches the long session's engine, which ends that generation.
+        let (target, abort_response) = send("long", "/verl/v1/abort", serde_json::json!({})).await;
+        assert_eq!(target, long);
+        to_bytes(abort_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = to_bytes(long_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"startedaborted");
+
+        // Both settled, so the long session's engine is the least busy although
+        // it holds far more context tokens (least tokens would pick the other).
+        let (next, next_response) =
+            send("next", "/verl/v1/generate", generate_body(10, false)).await;
+        assert_eq!(next, long);
+        to_bytes(next_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        // The short session's client drops its response mid-stream: that settles
+        // too, and a new session goes to the engine with fewer counted sessions.
+        drop(short_response);
+        let (last, _) = send("last", "/verl/v1/generate", generate_body(10, false)).await;
+        assert_eq!(last, short);
+
+        // The placement snapshot counts each new session once, not its later
+        // turns or its abort, and nothing is left in flight.
+        let snapshot = router.session_placement().await;
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        let body = to_bytes(snapshot.into_body(), usize::MAX).await.unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snapshot["rule"], "least_inflight");
+        for (worker, sessions) in [(&long, 2), (&short, 2)] {
+            let load = &snapshot["workers"][worker.as_str()];
+            assert_eq!(load["new_sessions"], sessions, "{snapshot}");
+            assert_eq!(load["moved_sessions"], 0, "{snapshot}");
+            assert_eq!(load["inflight"], 0, "{snapshot}");
         }
     }
 
