@@ -14,6 +14,10 @@
 //!   keyed request the regular Router places is leased; a caller that places
 //!   without leasing (prefill/decode routing) must not use this rule.
 //!
+//! `GET /session_placement` returns each worker's requests in flight, counted
+//! sessions and tokens, and how many sessions were placed on it new or moved
+//! there; sticky requests are not placements.
+//!
 //! Every request updates its session's context length. A routed request holds a
 //! [`SessionLease`] until it settles (response fully sent, failed or dropped);
 //! a session with a request in flight never expires, so a long generation keeps
@@ -63,6 +67,15 @@ pub enum PlacementRule {
     LeastInflight,
 }
 
+impl PlacementRule {
+    fn name(self) -> &'static str {
+        match self {
+            PlacementRule::LeastTokens => "least_tokens",
+            PlacementRule::LeastInflight => "least_inflight",
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Load {
     tokens: u64,
@@ -70,6 +83,9 @@ struct Load {
     /// Routed requests not yet settled: the sum of `Session::inflight` over the
     /// sessions this worker owns.
     inflight: u64,
+    /// Sessions placed here when first seen, and sessions moved here.
+    new_sessions: u64,
+    moved_sessions: u64,
 }
 
 impl Load {
@@ -220,7 +236,8 @@ impl TokenPlacement {
             !healthy.contains(&session.worker.as_str())
                 || (session.released && session.inflight == 0)
         });
-        if owner_gone || !state.sessions.contains_key(key) {
+        let is_new = !state.sessions.contains_key(key);
+        if owner_gone || is_new {
             // Re-placing an existing session keeps its in-flight count, so its
             // outstanding leases still settle against it; the count moves with it.
             state.set_counted(key, false);
@@ -246,7 +263,13 @@ impl TokenPlacement {
             if inflight > 0 {
                 let load = state.loads.entry(previous).or_default();
                 load.inflight = load.inflight.saturating_sub(inflight);
-                state.loads.entry(worker).or_default().inflight += inflight;
+            }
+            let load = state.loads.entry(worker).or_default();
+            load.inflight += inflight;
+            if is_new {
+                load.new_sessions += 1;
+            } else {
+                load.moved_sessions += 1;
             }
         }
 
@@ -337,6 +360,27 @@ impl TokenPlacement {
             .iter()
             .map(|(worker, load)| (worker.clone(), load.tokens))
             .collect()
+    }
+
+    /// The rule and, per worker, requests in flight, counted sessions and
+    /// tokens, and sessions placed there new or moved there.
+    pub fn snapshot(&self) -> serde_json::Value {
+        let state = self.state.lock().unwrap();
+        let workers: serde_json::Map<String, serde_json::Value> = state
+            .loads
+            .iter()
+            .map(|(worker, load)| {
+                let value = serde_json::json!({
+                    "inflight": load.inflight,
+                    "sessions": load.sessions,
+                    "tokens": load.tokens,
+                    "new_sessions": load.new_sessions,
+                    "moved_sessions": load.moved_sessions,
+                });
+                (worker.clone(), value)
+            })
+            .collect();
+        serde_json::json!({"rule": self.rule.name(), "workers": workers})
     }
 
     /// Routed requests in flight per worker, for diagnostics and tests.
@@ -715,6 +759,43 @@ mod tests {
         assert_eq!(inflight_on(&placement, &owner), 3);
         drop((busy, resumed, retry));
         assert!(placement.worker_inflight().values().all(|&n| n == 0));
+    }
+
+    /// The snapshot counts sessions placed new or moved per worker, apart from
+    /// sticky requests, next to requests in flight.
+    #[test]
+    fn snapshot_counts_new_and_moved_sessions_per_worker() {
+        let placement = least_inflight();
+        let now = Instant::now();
+        let (owner, generation) = dispatch(&placement, "s", &body(10), &["a", "b"], now);
+        let (sticky, turn) = dispatch(&placement, "s", &body(20), &["a", "b"], now);
+        assert_eq!(sticky, owner);
+        settle(&placement, generation, now);
+        settle(&placement, turn, now);
+        let other = if owner == "a" { "b" } else { "a" };
+        let (_, moved) = dispatch(&placement, "s", &body(30), &[other], now);
+        let snapshot = placement.snapshot();
+        assert_eq!(snapshot["rule"], "least_inflight");
+        let worker = &snapshot["workers"][owner.as_str()];
+        assert_eq!(
+            (
+                &worker["new_sessions"],
+                &worker["moved_sessions"],
+                &worker["inflight"]
+            ),
+            (&1.into(), &0.into(), &0.into())
+        );
+        let worker = &snapshot["workers"][other];
+        assert_eq!(
+            (
+                &worker["new_sessions"],
+                &worker["moved_sessions"],
+                &worker["inflight"]
+            ),
+            (&0.into(), &1.into(), &1.into())
+        );
+        assert_eq!(worker["sessions"], 1);
+        drop(moved);
     }
 
     #[test]

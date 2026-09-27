@@ -488,6 +488,12 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
         }
     }
 
+    fn session_placement(&self) -> Option<serde_json::Value> {
+        self.placement
+            .as_ref()
+            .map(|placement| placement.snapshot())
+    }
+
     fn release_session_owners(&self) -> usize {
         self.placement
             .as_ref()

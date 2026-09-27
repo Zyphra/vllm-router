@@ -1626,6 +1626,17 @@ impl RouterTrait for Router {
         }
     }
 
+    async fn session_placement(&self) -> Response {
+        match self
+            .policy_registry
+            .get_default_policy()
+            .session_placement()
+        {
+            Some(snapshot) => Json(snapshot).into_response(),
+            None => (StatusCode::NOT_FOUND, "session placement is off").into_response(),
+        }
+    }
+
     async fn reset_session_placement(&self) -> Response {
         let released = self.policy_registry.release_session_owners();
         info!("Released {} session owners for re-placement", released);
@@ -2048,6 +2059,20 @@ mod tests {
         drop(short_response);
         let (last, _) = send("last", "/verl/v1/generate", generate_body(10, false)).await;
         assert_eq!(last, short);
+
+        // The placement snapshot counts each new session once, not its later
+        // turns or its abort, and nothing is left in flight.
+        let snapshot = router.session_placement().await;
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        let body = to_bytes(snapshot.into_body(), usize::MAX).await.unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snapshot["rule"], "least_inflight");
+        for (worker, sessions) in [(&long, 2), (&short, 2)] {
+            let load = &snapshot["workers"][worker.as_str()];
+            assert_eq!(load["new_sessions"], sessions, "{snapshot}");
+            assert_eq!(load["moved_sessions"], 0, "{snapshot}");
+            assert_eq!(load["inflight"], 0, "{snapshot}");
+        }
     }
 
     #[test]
