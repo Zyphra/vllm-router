@@ -870,7 +870,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     println!("DEBUG: Creating HTTP client");
     let client = Client::builder()
         .pool_idle_timeout(Some(Duration::from_secs(config.pool_idle_timeout_secs)))
-        .pool_max_idle_per_host(500)
+        // Do not reuse idle backend sockets in this transport experiment.
+        // Session ownership is carried in request metadata, not the TCP socket.
+        .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .tcp_nodelay(true)
