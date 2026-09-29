@@ -511,7 +511,7 @@ impl Router {
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<(Arc<dyn Worker>, Option<SessionLease>)> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -536,8 +536,9 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
-        Some(available[idx].clone())
+        let (idx, lease) =
+            policy.select_worker_with_lease(&available, text, request_headers.as_ref())?;
+        Some((available[idx].clone(), lease))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -555,17 +556,18 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
-                    Some(w) => w,
-                    None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No available workers (all circuits open or unhealthy)",
-                        )
-                            .into_response();
-                    }
-                };
+                let (worker, lease) =
+                    match self.select_worker_for_model(model_id, Some(&text), headers) {
+                        Some(selected) => selected,
+                        None => {
+                            RouterMetrics::record_request_error(route, "no_available_workers");
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "No available workers (all circuits open or unhealthy)",
+                            )
+                                .into_response();
+                        }
+                    };
 
                 // Optional load tracking for cache-aware policy
                 // Get the policy for this model to check if it's cache-aware
@@ -573,11 +575,6 @@ impl Router {
                     Some(model) => self.policy_registry.get_policy_or_default(model),
                     None => self.policy_registry.get_default_policy(),
                 };
-
-                let lease = policy.lease_session(
-                    Some(&text),
-                    Self::headers_to_request_headers(headers).as_ref(),
-                );
 
                 let load_incremented = if policy.name() == "cache_aware" {
                     worker.increment_load();
@@ -1693,10 +1690,13 @@ impl RouterTrait for Router {
         debug!("Transparent proxy: routing {} {} to backend", method, path);
 
         // Select a worker (filter by availability like select_worker_for_model)
+        let policy = self.policy_registry.get_default_policy();
         let all_workers = self.worker_registry.get_all();
+        let native_abort = *method == Method::POST && path == "/verl/v1/abort";
+        let retained_abort = native_abort && policy.keeps_session_owners();
         let workers: Vec<Arc<dyn Worker>> = all_workers
             .iter()
-            .filter(|w| w.is_available())
+            .filter(|w| retained_abort || w.is_available())
             .cloned()
             .collect();
         if workers.is_empty() {
@@ -1707,27 +1707,37 @@ impl RouterTrait for Router {
                 .into_response();
         }
 
-        let policy = self.policy_registry.get_default_policy();
         let request_text = serde_json::to_string(&body).ok();
         let request_headers = Self::headers_to_request_headers(headers);
-        let worker_idx = match policy.select_worker_with_headers(
-            &workers,
-            request_text.as_deref(),
-            request_headers.as_ref(),
-        ) {
-            Some(idx) => idx,
+        let selected = if native_abort {
+            policy.select_worker_for_abort(
+                &workers,
+                request_text.as_deref(),
+                request_headers.as_ref(),
+            )
+        } else {
+            policy.select_worker_with_lease(
+                &workers,
+                request_text.as_deref(),
+                request_headers.as_ref(),
+            )
+        };
+        let (worker_idx, lease) = match selected {
+            Some(selected) => selected,
             None => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Failed to select a worker".to_string(),
+                    if retained_abort {
+                        "No retained worker for abort".to_string()
+                    } else {
+                        "Failed to select a worker".to_string()
+                    },
                 )
                     .into_response();
             }
         };
 
-        // Hold the session's owner until this request settles, so a long
-        // generation and its abort both reach the worker that owns it.
-        let lease = policy.lease_session(request_text.as_deref(), request_headers.as_ref());
+        // Selection already holds this owner until the HTTP request settles.
         drop(request_text);
 
         let worker: &dyn Worker = workers[worker_idx].as_ref();
@@ -2044,7 +2054,7 @@ mod tests {
         // Make multiple selections with the same headers - should all pick the same worker
         let mut selected_urls: Vec<String> = Vec::new();
         for _ in 0..10 {
-            let worker = router
+            let (worker, _lease) = router
                 .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), Some(&header_map))
                 .expect("Should select a worker");
             selected_urls.push(worker.url().to_string());
@@ -2074,7 +2084,7 @@ mod tests {
             }
         }
 
-        let worker = router
+        let (worker, _lease) = router
             .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None)
             .expect("Should select the remaining healthy worker");
 
@@ -2114,7 +2124,7 @@ mod tests {
             let session_id = format!("session-{}", i);
             header_map.insert("x-session-id", HeaderValue::from_str(&session_id).unwrap());
 
-            if let Some(worker) = router.select_worker_for_model(
+            if let Some((worker, _lease)) = router.select_worker_for_model(
                 None,
                 Some(r#"{"prompt": "test"}"#),
                 Some(&header_map),
