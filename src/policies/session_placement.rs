@@ -188,11 +188,21 @@ impl TokenPlacement {
 
     /// Release every session's owner (the prefix caches were reset): each session
     /// is re-placed on its next request made with none of its requests in flight.
+    /// Idle sessions no longer reserve load on their old workers; in-flight
+    /// sessions keep both their owner and load until their final request settles.
     /// Returns the number of sessions released.
     pub fn release_owners(&self) -> usize {
         let mut state = self.state.lock().unwrap();
-        for session in state.sessions.values_mut() {
-            session.released = true;
+        let idle: Vec<String> = state
+            .sessions
+            .iter_mut()
+            .filter_map(|(key, session)| {
+                session.released = true;
+                (session.inflight == 0).then(|| key.clone())
+            })
+            .collect();
+        for key in idle {
+            state.set_counted(&key, false);
         }
         state.sessions.len()
     }
@@ -216,9 +226,15 @@ impl TokenPlacement {
 
     fn settle_at(&self, key: &str, now: Instant) {
         let mut state = self.state.lock().unwrap();
-        if let Some(session) = state.sessions.get_mut(key) {
+        let released_and_idle = if let Some(session) = state.sessions.get_mut(key) {
             session.inflight = session.inflight.saturating_sub(1);
             session.last_seen = now;
+            session.released && session.inflight == 0
+        } else {
+            false
+        };
+        if released_and_idle {
+            state.set_counted(key, false);
         }
     }
 
@@ -321,6 +337,8 @@ mod tests {
         // A new session goes to the other, empty worker.
         let other = placement.place("t", Some(&body(10)), &workers);
         assert_ne!(other, owner);
+        // Without a reset, the idle session still counts until its idle timeout.
+        assert_eq!(tokens_on(&placement, &owner), 1000);
         assert_eq!(placement.place("s", Some(&body(5000)), &workers), owner);
         assert_eq!(tokens_on(&placement, &owner), 5000);
         // An abort-shaped body neither moves nor shrinks the session.
@@ -420,14 +438,18 @@ mod tests {
         // Make the owner the heavier worker so a re-placement would move "s".
         placement.place_at("u", Some(&body(50_000)), &[owner.as_str()], start);
         assert_eq!(placement.release_owners(), 3);
+        let other = if owner == "a" { "b" } else { "a" };
+        assert_eq!(tokens_on(&placement, &owner), 40_000);
+        assert_eq!(tokens_on(&placement, other), 0);
         // In flight: the abort and any resume keep the owner.
         assert_eq!(
             placement.place_at("s", Some("{\"request_id\":\"g\"}"), &workers, start),
             owner
         );
+        // New post-reset work makes the original owner heavier.
+        placement.place_at("v", Some(&body(50_000)), &[owner.as_str()], start);
         settle(&placement, generation, start);
         // Idle after the release: the resumed turn goes to the least-token worker.
-        let other = if owner == "a" { "b" } else { "a" };
         assert_eq!(
             placement.place_at("s", Some(&body(40_100)), &workers, start),
             other
@@ -438,6 +460,64 @@ mod tests {
             other
         );
         assert_eq!(tokens_on(&placement, &owner), 50_000);
+    }
+
+    #[test]
+    fn reset_uncounts_idle_sessions_before_new_placement() {
+        let placement = TokenPlacement::new(Duration::from_secs(900));
+        let workers = ["a", "b"];
+        let start = Instant::now();
+        assert_eq!(
+            placement.place_at("s", Some(&body(100)), &workers, start),
+            "a"
+        );
+        assert_eq!(
+            placement.place_at("t", Some(&body(50)), &workers, start),
+            "b"
+        );
+        // Neither completed session still owns a cache after reset. The old
+        // implementation instead keeps both loads until each session returns.
+        assert_eq!(placement.release_owners(), 2);
+        assert_eq!(tokens_on(&placement, "a"), 0);
+        assert_eq!(tokens_on(&placement, "b"), 0);
+        assert_eq!(placement.release_owners(), 2); // repeated reset is idempotent
+        assert_eq!(tokens_on(&placement, "a"), 0);
+        assert_eq!(tokens_on(&placement, "b"), 0);
+        assert_eq!(
+            placement.place_at("u", Some(&body(1)), &workers, start),
+            "a"
+        );
+        // The released old session is placed against only current load.
+        assert_eq!(
+            placement.place_at("s", Some(&body(101)), &workers, start),
+            "b"
+        );
+    }
+
+    #[test]
+    fn reset_keeps_inflight_abort_affinity_until_final_settlement() {
+        let placement = Arc::new(TokenPlacement::new(Duration::from_secs(900)));
+        let workers = ["a", "b"];
+        let start = Instant::now();
+        let owner = placement.place_at("s", Some(&body(100)), &workers, start);
+        let generation = placement.lease_at("s", start).unwrap();
+        placement.place_at("idle", Some(&body(50)), &workers, start);
+        assert_eq!(placement.release_owners(), 2);
+        assert_eq!(tokens_on(&placement, &owner), 100);
+        let other = if owner == "a" { "b" } else { "a" };
+        assert_eq!(tokens_on(&placement, other), 0);
+        assert_eq!(placement.release_owners(), 2); // still in flight
+        assert_eq!(
+            placement.place_at("s", Some("{\"request_id\":\"g\"}"), &workers, start),
+            owner
+        );
+        let abort = placement.lease_at("s", start).unwrap();
+        settle(&placement, abort, start);
+        assert_eq!(tokens_on(&placement, &owner), 100);
+        settle(&placement, generation, start);
+        assert_eq!(tokens_on(&placement, &owner), 0);
+        assert_eq!(placement.release_owners(), 2); // no double subtraction
+        assert_eq!(tokens_on(&placement, &owner), 0);
     }
 
     #[test]
