@@ -1,9 +1,18 @@
-//! Token-aware placement of new sessions for the consistent hash policy.
+//! Load-aware placement of new sessions for the consistent hash policy.
 //!
-//! Opt-in with `VLLM_ROUTER_SESSION_PLACEMENT=least_tokens`. A session key seen
-//! for the first time is placed on the healthy worker whose sessions hold the
-//! fewest context tokens, instead of the worker the hash ring names. Later
-//! requests of that session stay on the same worker for prefix-cache reuse.
+//! Opt-in with `VLLM_ROUTER_SESSION_PLACEMENT`:
+//! - `least_tokens`: a session key seen for the first time is placed on the
+//!   healthy worker whose sessions hold the fewest context tokens, instead of the
+//!   worker the hash ring names.
+//! - `bounded_hash`: consistent hashing with bounded loads. A new session goes to
+//!   the first healthy worker clockwise from its key on the hash ring whose open
+//!   sessions are below `ceil(c * (open sessions + 1) / workers)`, with
+//!   `c = VLLM_ROUTER_SESSION_LOAD_FACTOR` (default 1.25, at least 1). Most
+//!   sessions keep their ring worker; a worker whose ring arc is larger than its
+//!   share, or whose sessions run longer, stops taking new sessions at the bound
+//!   instead of queueing them behind a full engine.
+//!
+//! Later requests of a session stay on the same worker for prefix-cache reuse.
 //! Every request updates its session's context length. A routed request holds a
 //! [`SessionLease`] until it settles (response fully sent, failed or dropped);
 //! a session with a request in flight never expires, so a long generation keeps
@@ -28,6 +37,17 @@ use std::time::{Duration, Instant};
 
 pub const PLACEMENT_ENV: &str = "VLLM_ROUTER_SESSION_PLACEMENT";
 pub const IDLE_SECS_ENV: &str = "VLLM_ROUTER_SESSION_IDLE_SECS";
+pub const LOAD_FACTOR_ENV: &str = "VLLM_ROUTER_SESSION_LOAD_FACTOR";
+const DEFAULT_LOAD_FACTOR: f64 = 1.25;
+
+/// How a new (or released) session chooses its worker.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlacementRule {
+    /// The healthy worker with the fewest counted context tokens.
+    LeastTokens,
+    /// The first worker in hash-ring order below `ceil(factor * (sessions + 1) / workers)`.
+    BoundedHash { factor: f64 },
+}
 const DEFAULT_IDLE_SECS: u64 = 900;
 const RETAIN_IDLE_PERIODS: u32 = 4;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -96,13 +116,25 @@ impl Drop for SessionLease {
 #[derive(Debug)]
 pub struct TokenPlacement {
     idle: Duration,
+    rule: PlacementRule,
     state: Mutex<State>,
 }
 
 impl TokenPlacement {
     pub fn new(idle: Duration) -> Self {
+        Self::with_rule(idle, PlacementRule::LeastTokens)
+    }
+
+    pub fn with_rule(idle: Duration, rule: PlacementRule) -> Self {
+        if let PlacementRule::BoundedHash { factor } = rule {
+            assert!(
+                factor.is_finite() && factor >= 1.0,
+                "bounded_hash load factor must be finite and at least 1, got {factor}"
+            );
+        }
         Self {
             idle,
+            rule,
             state: Mutex::new(State {
                 sessions: HashMap::new(),
                 loads: HashMap::new(),
@@ -113,22 +145,39 @@ impl TokenPlacement {
 
     /// Build from the environment; `None` keeps plain consistent hashing.
     pub fn from_env() -> Option<Self> {
-        match std::env::var(PLACEMENT_ENV).ok().as_deref() {
-            None | Some("") | Some("hash") => None,
-            Some("least_tokens") => {
-                let idle = match std::env::var(IDLE_SECS_ENV).ok().as_deref() {
-                    None | Some("") => DEFAULT_IDLE_SECS,
-                    Some(value) => match value.parse::<u64>() {
-                        Ok(secs) if secs > 0 => secs,
-                        _ => panic!("{IDLE_SECS_ENV} must be a positive integer, got {value:?}"),
+        let rule = match std::env::var(PLACEMENT_ENV).ok().as_deref() {
+            None | Some("") | Some("hash") => return None,
+            Some("least_tokens") => PlacementRule::LeastTokens,
+            Some("bounded_hash") => PlacementRule::BoundedHash {
+                factor: match std::env::var(LOAD_FACTOR_ENV).ok().as_deref() {
+                    None | Some("") => DEFAULT_LOAD_FACTOR,
+                    Some(value) => match value.parse::<f64>() {
+                        Ok(factor) if factor.is_finite() && factor >= 1.0 => factor,
+                        _ => panic!(
+                            "{LOAD_FACTOR_ENV} must be a number of at least 1, got {value:?}"
+                        ),
                     },
-                };
-                Some(Self::new(Duration::from_secs(idle)))
-            }
+                },
+            },
             Some(other) => {
-                panic!("{PLACEMENT_ENV} must be 'hash' or 'least_tokens', got {other:?}")
+                panic!(
+                    "{PLACEMENT_ENV} must be 'hash', 'least_tokens' or 'bounded_hash', got {other:?}"
+                )
             }
-        }
+        };
+        let idle = match std::env::var(IDLE_SECS_ENV).ok().as_deref() {
+            None | Some("") => DEFAULT_IDLE_SECS,
+            Some(value) => match value.parse::<u64>() {
+                Ok(secs) if secs > 0 => secs,
+                _ => panic!("{IDLE_SECS_ENV} must be a positive integer, got {value:?}"),
+            },
+        };
+        Some(Self::with_rule(Duration::from_secs(idle), rule))
+    }
+
+    /// Whether [`TokenPlacement::place`] expects `healthy` in hash-ring order from the key.
+    pub fn wants_ring_order(&self) -> bool {
+        matches!(self.rule, PlacementRule::BoundedHash { .. })
     }
 
     /// Return the worker for session `key`. A new session, or one whose worker
@@ -160,11 +209,21 @@ impl TokenPlacement {
             // Re-placing an existing session keeps its in-flight count, so its
             // outstanding leases still settle against it.
             state.set_counted(key, false);
-            let worker = healthy
-                .iter()
-                .min_by_key(|worker| state.loads.get(**worker).copied().unwrap_or_default())
-                .expect("placement requires at least one healthy worker")
-                .to_string();
+            let load = |worker: &str| state.loads.get(worker).copied().unwrap_or_default();
+            let worker = match self.rule {
+                PlacementRule::LeastTokens => healthy.iter().min_by_key(|worker| load(worker)),
+                PlacementRule::BoundedHash { factor } => {
+                    let open: u64 = healthy.iter().map(|worker| load(worker).sessions).sum();
+                    let bound =
+                        (factor * (open + 1) as f64 / healthy.len().max(1) as f64).ceil() as u64;
+                    healthy
+                        .iter()
+                        .find(|worker| load(worker).sessions < bound)
+                        .or_else(|| healthy.iter().min_by_key(|worker| load(worker).sessions))
+                }
+            }
+            .expect("placement requires at least one healthy worker")
+            .to_string();
             let session = state.sessions.entry(key.to_string()).or_insert(Session {
                 worker: String::new(),
                 tokens: 0,
@@ -438,6 +497,50 @@ mod tests {
             other
         );
         assert_eq!(tokens_on(&placement, &owner), 50_000);
+    }
+
+    fn sessions_on(placement: &TokenPlacement) -> HashMap<String, u64> {
+        let state = placement.state.lock().unwrap();
+        state
+            .loads
+            .iter()
+            .map(|(worker, load)| (worker.clone(), load.sessions))
+            .collect()
+    }
+
+    #[test]
+    fn bounded_hash_keeps_ring_owner_until_the_bound() {
+        let placement = TokenPlacement::with_rule(
+            Duration::from_secs(900),
+            PlacementRule::BoundedHash { factor: 1.0 },
+        );
+        assert!(placement.wants_ring_order());
+        // Every key names "a" first on its ring walk; the bound moves the overflow on.
+        let order = ["a", "b", "c", "d"];
+        let owners: Vec<String> = (0..8)
+            .map(|i| placement.place(&format!("s{i}"), Some(&body(10)), &order))
+            .collect();
+        assert_eq!(owners[0], "a");
+        let loads = sessions_on(&placement);
+        assert!(loads.values().all(|&n| n == 2), "{loads:?}");
+        // Sessions stay put on later turns, whatever the loads.
+        for (i, owner) in owners.iter().enumerate() {
+            assert_eq!(
+                &placement.place(&format!("s{i}"), Some(&body(20)), &order),
+                owner
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_hash_rejects_a_factor_below_one() {
+        let result = std::panic::catch_unwind(|| {
+            TokenPlacement::with_rule(
+                Duration::from_secs(1),
+                PlacementRule::BoundedHash { factor: 0.9 },
+            )
+        });
+        assert!(result.is_err());
     }
 
     #[test]
