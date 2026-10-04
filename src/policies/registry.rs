@@ -46,6 +46,15 @@ impl PolicyRegistry {
         }
     }
 
+    /// Registry whose default policy is `policy`, built directly by a test.
+    #[cfg(test)]
+    pub(crate) fn with_default_policy(policy: Arc<dyn LoadBalancingPolicy>) -> Self {
+        Self {
+            default_policy: policy,
+            ..Self::new(PolicyConfig::RoundRobin)
+        }
+    }
+
     /// Called when a worker is added
     /// Returns the policy that should be used for this worker's model
     pub fn on_worker_added(

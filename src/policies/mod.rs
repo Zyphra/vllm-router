@@ -28,7 +28,7 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
-pub use session_placement::{SessionLease, TokenPlacement};
+pub use session_placement::{PlacementRule, SessionLease, TokenPlacement};
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value
@@ -108,6 +108,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         _headers: Option<&RequestHeaders>,
     ) -> Option<SessionLease> {
         None // Default: the policy keeps no per-session ownership
+    }
+
+    /// Per-worker session placement state, when the policy places sessions.
+    fn session_placement(&self) -> Option<serde_json::Value> {
+        None // Default: the policy keeps no session placement
     }
 
     /// Forget session ownership because every worker's prefix cache was reset
