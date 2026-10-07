@@ -2207,6 +2207,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_forward_error_releases_reservation() {
+        let (router, policy, backends) = placement_fixture().await;
+        let headers = placement_headers();
+        let (worker, lease) = router
+            .select_worker_for_model(None, Some("x"), Some(&headers))
+            .unwrap();
+        let owner = worker.url().to_string();
+        drop(lease);
+        heavy_on(&policy, &owner).await;
+        for (url, _, task) in &backends {
+            if url == &owner {
+                task.abort();
+            }
+        }
+        tokio::task::yield_now().await;
+        let failed = router
+            .route_transparent(
+                Some(&headers),
+                "/abort",
+                &Method::POST,
+                serde_json::json!({"request_id":"r"}),
+            )
+            .await;
+        assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+        router.reset_session_placement().await;
+        let successor = router
+            .route_transparent(
+                Some(&headers),
+                "/abort",
+                &Method::POST,
+                serde_json::json!({"request_id":"next"}),
+            )
+            .await;
+        assert_eq!(successor.status(), StatusCode::OK);
+        assert_ne!(response_text(successor).await, owner);
+        for (_, _, task) in backends {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_generation_reserves_owner_through_reset_and_drop() {
+        let (router, policy, backends) = placement_fixture().await;
+        let headers = placement_headers();
+        let request: GenerateRequest =
+            serde_json::from_value(serde_json::json!({"text":"x","stream":true})).unwrap();
+        let generation = router
+            .route_typed_request(Some(&headers), &request, "/native_generate", None)
+            .await;
+        assert_eq!(generation.status(), StatusCode::OK);
+        let owner = response_text(
+            router
+                .route_transparent(
+                    Some(&headers),
+                    "/abort",
+                    &Method::POST,
+                    serde_json::json!({"request_id":"r"}),
+                )
+                .await,
+        )
+        .await;
+        heavy_on(&policy, &owner).await;
+        router.reset_session_placement().await;
+        assert_eq!(
+            response_text(
+                router
+                    .route_transparent(
+                        Some(&headers),
+                        "/abort",
+                        &Method::POST,
+                        serde_json::json!({"request_id":"r"})
+                    )
+                    .await
+            )
+            .await,
+            owner
+        );
+        drop(generation);
+        assert_ne!(
+            response_text(
+                router
+                    .route_transparent(
+                        Some(&headers),
+                        "/abort",
+                        &Method::POST,
+                        serde_json::json!({"request_id":"next"})
+                    )
+                    .await
+            )
+            .await,
+            owner
+        );
+        for (_, _, task) in backends {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn placement_endpoints_use_server_routes_and_authorization() {
+        use crate::server::{build_app_with_request_tracing, AppContext, AppState};
+        use tower::ServiceExt;
+        let (router, _, backends) = placement_fixture().await;
+        let app_for = |validation: Vec<String>| {
+            let config = crate::config::RouterConfig::default();
+            let context =
+                Arc::new(AppContext::new(config, Client::new(), 10, None, validation).unwrap());
+            let state = Arc::new(AppState {
+                router: router.clone(),
+                context,
+                concurrency_queue_tx: None,
+                router_manager: None,
+            });
+            build_app_with_request_tracing(state, 1024 * 1024, vec![], vec![], true, false)
+        };
+        let app = app_for(vec![]);
+        for (method, path) in [
+            (Method::GET, "/session_placement"),
+            (Method::POST, "/reset_session_placement"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let metadata: serde_json::Value =
+                serde_json::from_str(&response_text(response).await).unwrap();
+            assert_eq!(metadata["atomic_select_and_lease"], true);
+            assert_eq!(metadata["placement"], "least_tokens");
+            let response = app_for(vec!["http://127.0.0.1:1/auth".to_string()])
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        for (_, _, task) in backends {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn placement_metadata_reports_effective_mode() {
         let (router, _, backends) = placement_fixture().await;
         let metadata: serde_json::Value =
