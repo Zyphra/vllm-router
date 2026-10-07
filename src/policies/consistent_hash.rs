@@ -594,6 +594,51 @@ mod tests {
     use crate::core::WorkerType;
 
     #[test]
+    fn leased_hash_selection_matches_existing_hash_without_reservations() {
+        let policy = ConsistentHashPolicy::with_placement(None);
+        let workers: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://worker-{i}"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        for i in 0..100 {
+            let headers = [("x-session-id".to_string(), format!("session-{i}"))]
+                .into_iter()
+                .collect();
+            let selected = policy
+                .select_worker_with_headers(&workers, Some("body"), Some(&headers))
+                .unwrap();
+            let (leased, lease) = policy
+                .select_worker_with_lease(&workers, Some("body"), Some(&headers))
+                .unwrap();
+            assert_eq!(selected, leased);
+            assert!(lease.is_none());
+        }
+        assert_eq!(policy.release_session_owners(), 0);
+        assert_eq!(policy.session_placement(), "hash");
+    }
+
+    #[test]
+    fn keyless_token_placement_keeps_hashing_without_reserving_a_session() {
+        let policy = ConsistentHashPolicy::with_placement(Some(TokenPlacement::new(
+            std::time::Duration::from_secs(900),
+        )));
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://worker".to_string(),
+            WorkerType::Regular,
+        ))];
+        let (selected, lease) = policy
+            .select_worker_with_lease(&workers, Some("{\"prompt_ids\":[1]}"), None)
+            .unwrap();
+        assert_eq!(selected, 0);
+        assert!(lease.is_none());
+        assert_eq!(policy.release_session_owners(), 0);
+    }
+
+    #[test]
     fn test_fbi_hash_consistency() {
         let key = "test_session_123";
         let hash1 = ConsistentHashPolicy::fbi_hash(key);
