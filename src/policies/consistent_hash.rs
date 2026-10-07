@@ -494,17 +494,43 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
             .map_or(0, |placement| placement.release_owners())
     }
 
-    fn lease_session(
+    fn select_worker_with_lease(
         &self,
+        workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
         headers: Option<&RequestHeaders>,
-    ) -> Option<SessionLease> {
-        let placement = self.placement.as_ref()?;
+    ) -> Option<(usize, Option<SessionLease>)> {
         let hash_key = hash_key::extract_hash_key(request_text, headers);
-        if hash_key.starts_with("request") {
-            return None;
+        if let Some(placement) = &self.placement {
+            if !hash_key.starts_with("request") {
+                let healthy_indices = get_healthy_worker_indices(workers);
+                if healthy_indices.is_empty() {
+                    return None;
+                }
+                let healthy: Vec<&str> = healthy_indices
+                    .iter()
+                    .map(|&idx| workers[idx].url())
+                    .collect();
+                let (target, lease) = placement.place_and_lease(&hash_key, request_text, &healthy);
+                let idx = healthy_indices
+                    .into_iter()
+                    .find(|&idx| workers[idx].url() == target)?;
+                workers[idx].increment_processed();
+                RouterMetrics::record_processed_request(&target);
+                RouterMetrics::record_policy_decision(self.name(), &target);
+                return Some((idx, Some(lease)));
+            }
         }
-        placement.lease(&hash_key)
+        self.select_worker_with_headers(workers, request_text, headers)
+            .map(|idx| (idx, None))
+    }
+
+    fn session_placement(&self) -> &'static str {
+        if self.placement.is_some() {
+            "least_tokens"
+        } else {
+            "hash"
+        }
     }
 
     fn name(&self) -> &'static str {

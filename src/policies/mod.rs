@@ -99,15 +99,21 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for stateless policies
     }
 
-    /// Hold the session a request was just routed for until the returned lease is
-    /// dropped. Call right after a selection with the same text and headers, and
-    /// keep the lease until the request settles (response sent, failed or dropped).
-    fn lease_session(
+    /// Select a worker and reserve its session atomically. Keep the lease through
+    /// response completion, errors and cancellation.
+    fn select_worker_with_lease(
         &self,
-        _request_text: Option<&str>,
-        _headers: Option<&RequestHeaders>,
-    ) -> Option<SessionLease> {
-        None // Default: the policy keeps no per-session ownership
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, Option<SessionLease>)> {
+        self.select_worker_with_headers(workers, request_text, headers)
+            .map(|idx| (idx, None))
+    }
+
+    /// Effective session placement mode, for capability admission.
+    fn session_placement(&self) -> &'static str {
+        "hash"
     }
 
     /// Forget session ownership because every worker's prefix cache was reset
