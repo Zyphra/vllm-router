@@ -511,6 +511,16 @@ async fn flush_cache(State(state): State<Arc<AppState>>, headers: http::HeaderMa
     state.router.flush_cache().await
 }
 
+async fn session_placement(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    state.router.session_placement()
+}
+
 async fn reset_session_placement(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -769,6 +779,7 @@ pub fn build_app_with_request_tracing(
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
         .route("/reset_session_placement", post(reset_session_placement))
+        .route("/session_placement", get(session_placement))
         .route("/get_loads", get(get_loads));
 
     // Worker management routes

@@ -162,6 +162,15 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
             .into_response()
     }
 
+    /// Session placement capabilities of this router.
+    fn session_placement(&self) -> Response {
+        (
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "session placement is not supported by this router",
+        )
+            .into_response()
+    }
+
     /// Get router type name
     fn router_type(&self) -> &'static str;
 
