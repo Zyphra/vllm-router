@@ -276,3 +276,23 @@ The continuous integration pipeline includes comprehensive testing, benchmarking
 ## Acknowledgement
 
 This project is a fork of [SGLang Model Gateway](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway), and we would like to explicitly acknowledge and thank the original authors for their work. At this stage, our fork includes only minimal changes to preserve the existing interface and ensure compatibility with vLLM. We anticipate further divergence as we pursue the roadmap we have in mind, which is the reason for creating the fork.
+
+### Session placement for native generation
+
+Consistent hashing remains the default. Set
+`VLLM_ROUTER_SESSION_PLACEMENT=least_tokens` to place new sessions on the healthy
+worker with the fewest counted context tokens, retaining session ownership for
+prefix-cache reuse. `VLLM_ROUTER_SESSION_IDLE_SECS` controls idle load expiry
+(default 900 seconds); ownership is retained for four idle periods.
+
+Regular HTTP routing selects the worker and acquires its session lease in one
+transaction. The lease holds ownership until the forwarded response completes,
+fails or is dropped, so concurrent native generation and abort requests retain
+the same owner across a reset. `POST /reset_session_placement` marks owners for
+re-placement on their next idle request; an in-flight request keeps its owner.
+
+`GET /session_placement` reports `atomic_select_and_lease: true` and the effective
+`placement` (`hash` or `least_tokens`). The reset response includes the same
+metadata and `released_sessions`. Both endpoints use the router's request
+authorization. Clients enabling token placement can verify these capabilities
+before dispatching requests.

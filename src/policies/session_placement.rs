@@ -134,8 +134,8 @@ impl TokenPlacement {
     /// Return the worker for session `key`. A new session, or one whose worker
     /// left `healthy`, goes to the healthy worker with the fewest counted
     /// context tokens (then fewest sessions, then the earliest in `healthy`).
-    /// `healthy` must not be empty. Call [`TokenPlacement::lease`] right after
-    /// and hold the lease until the routed request settles.
+    /// `healthy` must not be empty. For dispatch use [`Self::place_and_lease`]
+    /// so reset cannot move the owner between selection and reservation.
     pub fn place(&self, key: &str, request_text: Option<&str>, healthy: &[&str]) -> String {
         self.place_at(key, request_text, healthy, Instant::now())
     }
@@ -147,10 +147,40 @@ impl TokenPlacement {
         healthy: &[&str],
         now: Instant,
     ) -> String {
+        let mut state = self.state.lock().unwrap();
+        self.place_locked(&mut state, key, request_text, healthy, now)
+    }
+
+    /// Select and reserve the owner in one transaction. Hold the returned lease
+    /// until the routed response completes, fails or is dropped.
+    pub fn place_and_lease(
+        self: &Arc<Self>,
+        key: &str,
+        request_text: Option<&str>,
+        healthy: &[&str],
+    ) -> (String, SessionLease) {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        let worker = self.place_locked(&mut state, key, request_text, healthy, now);
+        state.sessions.get_mut(key).unwrap().inflight += 1;
+        let lease = SessionLease {
+            placement: Arc::clone(self),
+            key: key.to_string(),
+        };
+        (worker, lease)
+    }
+
+    fn place_locked(
+        &self,
+        state: &mut State,
+        key: &str,
+        request_text: Option<&str>,
+        healthy: &[&str],
+        now: Instant,
+    ) -> String {
         let exact = prompt_token_count(request_text);
         let estimate = request_text.map_or(0, |text| text.len() as u64 / 4);
-        let mut state = self.state.lock().unwrap();
-        self.sweep(&mut state, now);
+        self.sweep(state, now);
 
         let owner_gone = state.sessions.get(key).is_some_and(|session| {
             !healthy.contains(&session.worker.as_str())
@@ -197,11 +227,7 @@ impl TokenPlacement {
         state.sessions.len()
     }
 
-    /// Mark one request of `key` in flight; `None` when `key` was never placed.
-    pub fn lease(self: &Arc<Self>, key: &str) -> Option<SessionLease> {
-        self.lease_at(key, Instant::now())
-    }
-
+    #[cfg(test)]
     fn lease_at(self: &Arc<Self>, key: &str, now: Instant) -> Option<SessionLease> {
         let mut state = self.state.lock().unwrap();
         let session = state.sessions.get_mut(key)?;
@@ -438,6 +464,48 @@ mod tests {
             other
         );
         assert_eq!(tokens_on(&placement, &owner), 50_000);
+    }
+
+    #[test]
+    fn atomic_reservation_keeps_owner_across_concurrent_resets_and_aborts() {
+        let placement = Arc::new(TokenPlacement::new(Duration::from_secs(900)));
+        let workers = ["a", "b"];
+        let (owner, generation) = placement.place_and_lease("s", Some(&body(100)), &workers);
+        placement.place("heavy", Some(&body(1000)), &[owner.as_str()]);
+        let reset = Arc::clone(&placement);
+        let resetter = std::thread::spawn(move || {
+            for _ in 0..1000 {
+                reset.release_owners();
+                std::thread::yield_now();
+            }
+        });
+        for _ in 0..1000 {
+            let (abort_owner, abort) =
+                placement.place_and_lease("s", Some("{\"request_id\":\"r\"}"), &workers);
+            assert_eq!(abort_owner, owner);
+            drop(abort);
+        }
+        resetter.join().unwrap();
+        placement.release_owners();
+        drop(generation);
+        let (next_owner, next) = placement.place_and_lease("s", Some(&body(100)), &workers);
+        assert_ne!(next_owner, owner);
+        drop(next);
+        assert_eq!(placement.state.lock().unwrap().sessions["s"].inflight, 0);
+    }
+
+    #[test]
+    fn atomic_lease_drop_allows_idle_expiry() {
+        let placement = Arc::new(TokenPlacement::new(Duration::from_secs(10)));
+        let (owner, request) = placement.place_and_lease("s", Some(&body(1000)), &["a", "b"]);
+        drop(request);
+        placement.place_at(
+            "next",
+            Some(&body(1)),
+            &["a", "b"],
+            Instant::now() + Duration::from_secs(11),
+        );
+        assert!(tokens_on(&placement, &owner) <= 1);
     }
 
     #[test]

@@ -46,6 +46,13 @@ impl PolicyRegistry {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_default_policy(policy: Arc<dyn LoadBalancingPolicy>) -> Self {
+        let mut registry = Self::new(PolicyConfig::Random);
+        registry.default_policy = policy;
+        registry
+    }
+
     /// Called when a worker is added
     /// Returns the policy that should be used for this worker's model
     pub fn on_worker_added(

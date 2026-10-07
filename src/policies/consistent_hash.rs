@@ -494,17 +494,43 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
             .map_or(0, |placement| placement.release_owners())
     }
 
-    fn lease_session(
+    fn select_worker_with_lease(
         &self,
+        workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
         headers: Option<&RequestHeaders>,
-    ) -> Option<SessionLease> {
-        let placement = self.placement.as_ref()?;
+    ) -> Option<(usize, Option<SessionLease>)> {
         let hash_key = hash_key::extract_hash_key(request_text, headers);
-        if hash_key.starts_with("request") {
-            return None;
+        if let Some(placement) = &self.placement {
+            if !hash_key.starts_with("request") {
+                let healthy_indices = get_healthy_worker_indices(workers);
+                if healthy_indices.is_empty() {
+                    return None;
+                }
+                let healthy: Vec<&str> = healthy_indices
+                    .iter()
+                    .map(|&idx| workers[idx].url())
+                    .collect();
+                let (target, lease) = placement.place_and_lease(&hash_key, request_text, &healthy);
+                let idx = healthy_indices
+                    .into_iter()
+                    .find(|&idx| workers[idx].url() == target)?;
+                workers[idx].increment_processed();
+                RouterMetrics::record_processed_request(&target);
+                RouterMetrics::record_policy_decision(self.name(), &target);
+                return Some((idx, Some(lease)));
+            }
         }
-        placement.lease(&hash_key)
+        self.select_worker_with_headers(workers, request_text, headers)
+            .map(|idx| (idx, None))
+    }
+
+    fn session_placement(&self) -> &'static str {
+        if self.placement.is_some() {
+            "least_tokens"
+        } else {
+            "hash"
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -566,6 +592,51 @@ mod tests {
     use super::*;
     use crate::core::BasicWorker;
     use crate::core::WorkerType;
+
+    #[test]
+    fn leased_hash_selection_matches_existing_hash_without_reservations() {
+        let policy = ConsistentHashPolicy::with_placement(None);
+        let workers: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://worker-{i}"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        for i in 0..100 {
+            let headers = [("x-session-id".to_string(), format!("session-{i}"))]
+                .into_iter()
+                .collect();
+            let selected = policy
+                .select_worker_with_headers(&workers, Some("body"), Some(&headers))
+                .unwrap();
+            let (leased, lease) = policy
+                .select_worker_with_lease(&workers, Some("body"), Some(&headers))
+                .unwrap();
+            assert_eq!(selected, leased);
+            assert!(lease.is_none());
+        }
+        assert_eq!(policy.release_session_owners(), 0);
+        assert_eq!(policy.session_placement(), "hash");
+    }
+
+    #[test]
+    fn keyless_token_placement_keeps_hashing_without_reserving_a_session() {
+        let policy = ConsistentHashPolicy::with_placement(Some(TokenPlacement::new(
+            std::time::Duration::from_secs(900),
+        )));
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://worker".to_string(),
+            WorkerType::Regular,
+        ))];
+        let (selected, lease) = policy
+            .select_worker_with_lease(&workers, Some("{\"prompt_ids\":[1]}"), None)
+            .unwrap();
+        assert_eq!(selected, 0);
+        assert!(lease.is_none());
+        assert_eq!(policy.release_session_owners(), 0);
+    }
 
     #[test]
     fn test_fbi_hash_consistency() {

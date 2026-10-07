@@ -515,7 +515,7 @@ impl Router {
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<(Arc<dyn Worker>, Option<SessionLease>)> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -540,8 +540,9 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
-        Some(available[idx].clone())
+        let (idx, lease) =
+            policy.select_worker_with_lease(&available, text, request_headers.as_ref())?;
+        Some((available[idx].clone(), lease))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -559,17 +560,18 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
-                    Some(w) => w,
-                    None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No available workers (all circuits open or unhealthy)",
-                        )
-                            .into_response();
-                    }
-                };
+                let (worker, lease) =
+                    match self.select_worker_for_model(model_id, Some(&text), headers) {
+                        Some(w) => w,
+                        None => {
+                            RouterMetrics::record_request_error(route, "no_available_workers");
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "No available workers (all circuits open or unhealthy)",
+                            )
+                                .into_response();
+                        }
+                    };
 
                 // Optional load tracking for cache-aware policy
                 // Get the policy for this model to check if it's cache-aware
@@ -577,11 +579,6 @@ impl Router {
                     Some(model) => self.policy_registry.get_policy_or_default(model),
                     None => self.policy_registry.get_default_policy(),
                 };
-
-                let lease = policy.lease_session(
-                    Some(&text),
-                    Self::headers_to_request_headers(headers).as_ref(),
-                );
 
                 let load_incremented = if policy.name() == "cache_aware" {
                     worker.increment_load();
@@ -1633,7 +1630,20 @@ impl RouterTrait for Router {
     async fn reset_session_placement(&self) -> Response {
         let released = self.policy_registry.release_session_owners();
         info!("Released {} session owners for re-placement", released);
-        Json(serde_json::json!({ "released_sessions": released })).into_response()
+        Json(serde_json::json!({
+            "released_sessions": released,
+            "atomic_select_and_lease": true,
+            "placement": self.policy_registry.get_default_policy().session_placement(),
+        }))
+        .into_response()
+    }
+
+    fn session_placement(&self) -> Response {
+        Json(serde_json::json!({
+            "atomic_select_and_lease": true,
+            "placement": self.policy_registry.get_default_policy().session_placement(),
+        }))
+        .into_response()
     }
 
     async fn get_worker_loads(&self) -> Response {
@@ -1714,7 +1724,7 @@ impl RouterTrait for Router {
         let policy = self.policy_registry.get_default_policy();
         let request_text = serde_json::to_string(&body).ok();
         let request_headers = Self::headers_to_request_headers(headers);
-        let worker_idx = match policy.select_worker_with_headers(
+        let (worker_idx, lease) = match policy.select_worker_with_lease(
             &workers,
             request_text.as_deref(),
             request_headers.as_ref(),
@@ -1729,9 +1739,6 @@ impl RouterTrait for Router {
             }
         };
 
-        // Hold the session's owner until this request settles, so a long
-        // generation and its abort both reach the worker that owns it.
-        let lease = policy.lease_session(request_text.as_deref(), request_headers.as_ref());
         drop(request_text);
 
         let worker: &dyn Worker = workers[worker_idx].as_ref();
@@ -1984,6 +1991,393 @@ mod tests {
         }
     }
 
+    /// Actual HTTP backend: the generation stream stays open until the sender is
+    /// dropped; abort reports which backend received it.
+    async fn placement_backend() -> (
+        String,
+        tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let rx = Arc::new(tokio::sync::Mutex::new(Some(rx)));
+        let app = axum::Router::new()
+            .route(
+                "/native_generate",
+                axum::routing::post(move || {
+                    let rx = Arc::clone(&rx);
+                    async move {
+                        let receiver = rx.lock().await.take().unwrap();
+                        Response::new(Body::from_stream(UnboundedReceiverStream::new(receiver)))
+                    }
+                }),
+            )
+            .route(
+                "/abort",
+                axum::routing::post({
+                    let url = url.clone();
+                    move || {
+                        let url = url.clone();
+                        async move { url }
+                    }
+                }),
+            );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, tx, task)
+    }
+
+    async fn placement_fixture() -> (
+        Arc<Router>,
+        Arc<dyn LoadBalancingPolicy>,
+        Vec<(
+            String,
+            tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
+            tokio::task::JoinHandle<()>,
+        )>,
+    ) {
+        let backends = vec![placement_backend().await, placement_backend().await];
+        let policy: Arc<dyn LoadBalancingPolicy> =
+            Arc::new(crate::policies::ConsistentHashPolicy::with_placement(Some(
+                crate::policies::TokenPlacement::new(Duration::from_secs(900)),
+            )));
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, _, _) in &backends {
+            router
+                .worker_registry
+                .register(Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular)));
+        }
+        router.policy_registry = Arc::new(PolicyRegistry::with_default_policy(Arc::clone(&policy)));
+        (Arc::new(router), policy, backends)
+    }
+
+    fn placement_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("generation"));
+        headers
+    }
+
+    async fn response_text(response: Response) -> String {
+        String::from_utf8(
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    async fn heavy_on(policy: &Arc<dyn LoadBalancingPolicy>, owner: &str) {
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            owner.to_string(),
+            WorkerType::Regular,
+        ))];
+        let headers = [("x-session-id".to_string(), "heavy".to_string())]
+            .into_iter()
+            .collect();
+        let text = serde_json::json!({"prompt_ids": vec![1;1000]}).to_string();
+        let (_, lease) = policy
+            .select_worker_with_lease(&workers, Some(&text), Some(&headers))
+            .unwrap();
+        drop(lease);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_generation_reset_abort_keep_owner_until_stream_completion() {
+        let (router, policy, backends) = placement_fixture().await;
+        let headers = placement_headers();
+        let generation = router
+            .route_transparent(
+                Some(&headers),
+                "/native_generate",
+                &Method::POST,
+                serde_json::json!({"prompt_ids":[1], "request_id":"r"}),
+            )
+            .await;
+        assert_eq!(generation.status(), StatusCode::OK);
+        let owner = response_text(
+            router
+                .route_transparent(
+                    Some(&headers),
+                    "/abort",
+                    &Method::POST,
+                    serde_json::json!({"request_id":"r"}),
+                )
+                .await,
+        )
+        .await;
+        heavy_on(&policy, &owner).await;
+        let resetting = Arc::clone(&router);
+        let resetter = tokio::spawn(async move {
+            for _ in 0..100 {
+                assert_eq!(
+                    resetting.reset_session_placement().await.status(),
+                    StatusCode::OK
+                );
+                tokio::task::yield_now().await;
+            }
+        });
+        for _ in 0..100 {
+            let abort = router
+                .route_transparent(
+                    Some(&headers),
+                    "/abort",
+                    &Method::POST,
+                    serde_json::json!({"request_id":"r"}),
+                )
+                .await;
+            assert_eq!(response_text(abort).await, owner);
+        }
+        resetter.await.unwrap();
+        // Consuming EOF settles the original generation's response lease.
+        for (_, tx, _) in &backends {
+            tx.send(Ok(bytes::Bytes::from_static(b"done"))).unwrap();
+        }
+        let mut tasks = Vec::new();
+        for (_, tx, task) in backends {
+            drop(tx);
+            tasks.push(task);
+        }
+        assert_eq!(response_text(generation).await, "done");
+        assert_ne!(
+            response_text(
+                router
+                    .route_transparent(
+                        Some(&headers),
+                        "/abort",
+                        &Method::POST,
+                        serde_json::json!({"request_id":"next"})
+                    )
+                    .await
+            )
+            .await,
+            owner
+        );
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_generation_body_drop_releases_owner() {
+        let (router, policy, backends) = placement_fixture().await;
+        let headers = placement_headers();
+        let generation = router
+            .route_transparent(
+                Some(&headers),
+                "/native_generate",
+                &Method::POST,
+                serde_json::json!({"prompt_ids":[1]}),
+            )
+            .await;
+        let owner = response_text(
+            router
+                .route_transparent(
+                    Some(&headers),
+                    "/abort",
+                    &Method::POST,
+                    serde_json::json!({"request_id":"r"}),
+                )
+                .await,
+        )
+        .await;
+        heavy_on(&policy, &owner).await;
+        router.reset_session_placement().await;
+        drop(generation);
+        assert_ne!(
+            response_text(
+                router
+                    .route_transparent(
+                        Some(&headers),
+                        "/abort",
+                        &Method::POST,
+                        serde_json::json!({"request_id":"next"})
+                    )
+                    .await
+            )
+            .await,
+            owner
+        );
+        for (_, _, task) in backends {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_forward_error_releases_reservation() {
+        let (router, policy, backends) = placement_fixture().await;
+        let headers = placement_headers();
+        let (worker, lease) = router
+            .select_worker_for_model(None, Some("x"), Some(&headers))
+            .unwrap();
+        let owner = worker.url().to_string();
+        drop(lease);
+        heavy_on(&policy, &owner).await;
+        for (url, _, task) in &backends {
+            if url == &owner {
+                task.abort();
+            }
+        }
+        tokio::task::yield_now().await;
+        let failed = router
+            .route_transparent(
+                Some(&headers),
+                "/abort",
+                &Method::POST,
+                serde_json::json!({"request_id":"r"}),
+            )
+            .await;
+        assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+        router.reset_session_placement().await;
+        let successor = router
+            .route_transparent(
+                Some(&headers),
+                "/abort",
+                &Method::POST,
+                serde_json::json!({"request_id":"next"}),
+            )
+            .await;
+        assert_eq!(successor.status(), StatusCode::OK);
+        assert_ne!(response_text(successor).await, owner);
+        for (_, _, task) in backends {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_generation_reserves_owner_through_reset_and_drop() {
+        let (router, policy, backends) = placement_fixture().await;
+        let headers = placement_headers();
+        let request: GenerateRequest =
+            serde_json::from_value(serde_json::json!({"text":"x","stream":true})).unwrap();
+        let generation = router
+            .route_typed_request(Some(&headers), &request, "/native_generate", None)
+            .await;
+        assert_eq!(generation.status(), StatusCode::OK);
+        let owner = response_text(
+            router
+                .route_transparent(
+                    Some(&headers),
+                    "/abort",
+                    &Method::POST,
+                    serde_json::json!({"request_id":"r"}),
+                )
+                .await,
+        )
+        .await;
+        heavy_on(&policy, &owner).await;
+        router.reset_session_placement().await;
+        assert_eq!(
+            response_text(
+                router
+                    .route_transparent(
+                        Some(&headers),
+                        "/abort",
+                        &Method::POST,
+                        serde_json::json!({"request_id":"r"})
+                    )
+                    .await
+            )
+            .await,
+            owner
+        );
+        drop(generation);
+        assert_ne!(
+            response_text(
+                router
+                    .route_transparent(
+                        Some(&headers),
+                        "/abort",
+                        &Method::POST,
+                        serde_json::json!({"request_id":"next"})
+                    )
+                    .await
+            )
+            .await,
+            owner
+        );
+        for (_, _, task) in backends {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn placement_endpoints_use_server_routes_and_authorization() {
+        use crate::server::{build_app_with_request_tracing, AppContext, AppState};
+        use tower::ServiceExt;
+        let (router, _, backends) = placement_fixture().await;
+        let app_for = |validation: Vec<String>| {
+            let config = crate::config::RouterConfig::default();
+            let context =
+                Arc::new(AppContext::new(config, Client::new(), 10, None, validation).unwrap());
+            let state = Arc::new(AppState {
+                router: router.clone(),
+                context,
+                concurrency_queue_tx: None,
+                router_manager: None,
+            });
+            build_app_with_request_tracing(state, 1024 * 1024, vec![], vec![], true, false)
+        };
+        let app = app_for(vec![]);
+        for (method, path) in [
+            (Method::GET, "/session_placement"),
+            (Method::POST, "/reset_session_placement"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let metadata: serde_json::Value =
+                serde_json::from_str(&response_text(response).await).unwrap();
+            assert_eq!(metadata["atomic_select_and_lease"], true);
+            assert_eq!(metadata["placement"], "least_tokens");
+            let response = app_for(vec!["http://127.0.0.1:1/auth".to_string()])
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        for (_, _, task) in backends {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn placement_metadata_reports_effective_mode() {
+        let (router, _, backends) = placement_fixture().await;
+        let metadata: serde_json::Value =
+            serde_json::from_str(&response_text(router.session_placement()).await).unwrap();
+        assert_eq!(
+            metadata,
+            serde_json::json!({"atomic_select_and_lease":true,"placement":"least_tokens"})
+        );
+        let reset: serde_json::Value =
+            serde_json::from_str(&response_text(router.reset_session_placement().await).await)
+                .unwrap();
+        assert_eq!(reset["atomic_select_and_lease"], true);
+        assert_eq!(reset["released_sessions"], 0);
+        for (_, _, task) in backends {
+            task.abort();
+        }
+    }
+
     #[test]
     fn test_headers_to_request_headers_basic() {
         // Test that headers_to_request_headers correctly converts HeaderMap to HashMap
@@ -2033,7 +2427,7 @@ mod tests {
             let worker = router
                 .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), Some(&header_map))
                 .expect("Should select a worker");
-            selected_urls.push(worker.url().to_string());
+            selected_urls.push(worker.0.url().to_string());
         }
 
         // All selections should go to the same worker (sticky routing)
@@ -2065,7 +2459,7 @@ mod tests {
             .expect("Should select the remaining healthy worker");
 
         assert_eq!(
-            worker.url(),
+            worker.0.url(),
             "http://worker3:8080",
             "Should only select the healthy worker"
         );
@@ -2105,7 +2499,7 @@ mod tests {
                 Some(r#"{"prompt": "test"}"#),
                 Some(&header_map),
             ) {
-                worker_urls_seen.insert(worker.url().to_string());
+                worker_urls_seen.insert(worker.0.url().to_string());
             }
         }
 
