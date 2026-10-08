@@ -322,6 +322,31 @@ impl ConsistentHashPolicy {
         selected_worker
     }
 
+    /// `healthy` workers in hash-ring order from `hash_key`: the ring worker first,
+    /// then each next distinct worker clockwise. Workers absent from the ring keep
+    /// their `healthy` order at the end.
+    fn ring_order<'a>(&self, hash_key: &str, healthy: &[&'a str]) -> Vec<&'a str> {
+        let hash_value = Self::fbi_hash(hash_key);
+        let ring = self.hash_ring.read().unwrap();
+        let mut ordered: Vec<&'a str> = Vec::with_capacity(healthy.len());
+        for (_, worker) in ring.range(hash_value..).chain(ring.range(..hash_value)) {
+            if ordered.len() == healthy.len() {
+                break;
+            }
+            if let Some(&url) = healthy.iter().find(|url| **url == worker.as_str()) {
+                if !ordered.contains(&url) {
+                    ordered.push(url);
+                }
+            }
+        }
+        for &url in healthy {
+            if !ordered.contains(&url) {
+                ordered.push(url);
+            }
+        }
+        ordered
+    }
+
     /// Handle DP-aware routing by extracting DP rank from worker URL
     fn extract_dp_info(&self, worker_url: &str) -> (String, Option<usize>) {
         if worker_url.contains('@') {
@@ -371,10 +396,13 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
         // worker holding the fewest context tokens. Keyless requests keep hashing.
         if let Some(placement) = &self.placement {
             if !hash_key.starts_with("request") {
-                let healthy: Vec<&str> = healthy_indices
+                let mut healthy: Vec<&str> = healthy_indices
                     .iter()
                     .map(|&idx| workers[idx].url())
                     .collect();
+                if placement.wants_ring_order() {
+                    healthy = self.ring_order(&hash_key, &healthy);
+                }
                 let target = placement.place(&hash_key, request_text, &healthy);
                 let idx = healthy_indices
                     .iter()
@@ -762,6 +790,65 @@ mod tests {
         assert!(
             *by_tokens.iter().min().unwrap() >= mean / 2,
             "{by_tokens:?}"
+        );
+    }
+
+    /// 4096 sessions open on 16 workers. The 160-node hash ring alone gives some
+    /// workers well over the mean; bounded loads cap every worker at
+    /// ceil(c * mean) while most sessions keep their ring worker.
+    #[test]
+    fn test_bounded_hash_caps_ring_skew() {
+        use super::super::session_placement::PlacementRule;
+        const WORKERS: usize = 16;
+        const SESSIONS: usize = 4096;
+        let workers: Vec<Arc<dyn Worker>> = (0..WORKERS)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://192.168.128.{}:{}", 157 + i % 2, 33000 + 997 * i),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let route = |policy: &ConsistentHashPolicy| {
+            let mut placed = [0usize; WORKERS];
+            let mut owner = Vec::with_capacity(SESSIONS);
+            for i in 0..SESSIONS {
+                let headers: RequestHeaders =
+                    [("x-session-id".to_string(), format!("{i:032x}"))].into();
+                let body = native_body(8);
+                let idx = policy
+                    .select_worker_with_headers(&workers, Some(&body), Some(&headers))
+                    .unwrap();
+                let again = policy
+                    .select_worker_with_headers(&workers, Some(&body), Some(&headers))
+                    .unwrap();
+                assert_eq!(idx, again, "session {i} moved");
+                placed[idx] += 1;
+                owner.push(idx);
+            }
+            (placed, owner)
+        };
+        let (by_hash, hash_owner) = route(&ConsistentHashPolicy::with_placement(None));
+        let factor = 1.05;
+        let (bounded, bounded_owner) = route(&ConsistentHashPolicy::with_placement(Some(
+            TokenPlacement::with_rule(
+                std::time::Duration::from_secs(900),
+                PlacementRule::BoundedHash { factor },
+            ),
+        )));
+        let bound = (factor * SESSIONS as f64 / WORKERS as f64).ceil() as usize;
+        println!("hash={by_hash:?} bounded={bounded:?} bound={bound}");
+        assert_eq!(bounded.iter().sum::<usize>(), SESSIONS);
+        assert!(*by_hash.iter().max().unwrap() > bound, "{by_hash:?}");
+        assert!(bounded.iter().all(|&n| n <= bound), "{bounded:?}");
+        let kept = hash_owner
+            .iter()
+            .zip(&bounded_owner)
+            .filter(|(a, b)| a == b)
+            .count();
+        assert!(
+            kept * 10 >= SESSIONS * 8,
+            "only {kept} of {SESSIONS} kept their ring worker"
         );
     }
 }

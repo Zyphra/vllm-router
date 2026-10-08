@@ -28,7 +28,7 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
-pub use session_placement::{SessionLease, TokenPlacement};
+pub use session_placement::{PlacementRule, SessionLease, TokenPlacement};
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value
