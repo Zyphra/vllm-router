@@ -2002,12 +2002,15 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let rx = Arc::new(tokio::sync::Mutex::new(Some(rx)));
+        let backend_url = url.clone();
         let app = axum::Router::new()
             .route(
                 "/native_generate",
                 axum::routing::post(move || {
                     let rx = Arc::clone(&rx);
+                    let backend_url = backend_url.clone();
                     async move {
+                        println!("native_test_backend_received={backend_url}");
                         let receiver = rx.lock().await.take().unwrap();
                         Response::new(Body::from_stream(UnboundedReceiverStream::new(receiver)))
                     }
@@ -2097,6 +2100,16 @@ mod tests {
         let (first, second) = tokio::join!(
             router.route_typed_request(None, &request, "/native_generate", None),
             router.route_typed_request(None, &request, "/native_generate", None),
+        );
+        println!(
+            "headerless_http_statuses={:?}, loads={:?}",
+            [first.status(), second.status()],
+            router
+                .worker_registry
+                .get_all()
+                .iter()
+                .map(|worker| (worker.url().to_string(), worker.load()))
+                .collect::<Vec<_>>()
         );
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(second.status(), StatusCode::OK);
