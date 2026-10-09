@@ -2022,6 +2022,10 @@ mod tests {
                         async move { url }
                     }
                 }),
+            )
+            .route(
+                "/failure",
+                axum::routing::post(|| async { StatusCode::BAD_GATEWAY }),
             );
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -2058,6 +2062,174 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-session-id", HeaderValue::from_static("generation"));
         headers
+    }
+
+    async fn stateless_fixture() -> (
+        Arc<Router>,
+        Vec<(
+            String,
+            tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
+            tokio::task::JoinHandle<()>,
+        )>,
+    ) {
+        let (mut router, _, backends) = placement_fixture().await;
+        let router_mut = Arc::get_mut(&mut router).unwrap();
+        router_mut.policy_registry = Arc::new(PolicyRegistry::with_default_policy(Arc::new(
+            crate::policies::ConsistentHashPolicy::with_placement(None),
+        )));
+        router_mut.retry_config.max_retries = 1;
+        router_mut.retry_config.initial_backoff_ms = 1;
+        (router, backends)
+    }
+
+    fn stateless_chat(stream: bool) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model":"m", "messages":[{"role":"user","content":"hello"}], "stream":stream
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn headerless_chat_concurrent_streams_use_both_backends_and_drain() {
+        let (router, backends) = stateless_fixture().await;
+        let request = stateless_chat(true);
+        assert!(request.extract_text_for_routing().is_empty());
+        let (first, second) = tokio::join!(
+            router.route_typed_request(None, &request, "/native_generate", None),
+            router.route_typed_request(None, &request, "/native_generate", None),
+        );
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        let workers = router.worker_registry.get_all();
+        assert!(workers.iter().all(|worker| worker.load() == 1));
+        let expected: std::collections::HashSet<_> = backends.iter().map(|b| b.0.clone()).collect();
+        for (url, tx, _) in &backends {
+            tx.send(Ok(bytes::Bytes::from(url.clone()))).unwrap();
+        }
+        let mut backend_tasks = Vec::new();
+        for (_, tx, task) in backends {
+            drop(tx);
+            backend_tasks.push(task);
+        }
+        let actual = [response_text(first).await, response_text(second).await]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(actual, expected);
+        assert!(workers.iter().all(|worker| worker.load() == 0));
+        for task in backend_tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn headerless_chat_load_settles_on_drop_stream_error_retry_and_cancellation() {
+        for mode in ["drop", "stream_error", "retry", "cancel"] {
+            let (router, backends) = stateless_fixture().await;
+            let workers = router.worker_registry.get_all();
+            let request = stateless_chat(mode != "cancel");
+            if mode == "cancel" {
+                let routing = Arc::clone(&router);
+                let pending = tokio::spawn(async move {
+                    routing
+                        .route_typed_request(None, &request, "/native_generate", None)
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while workers.iter().map(|worker| worker.load()).sum::<usize>() != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                pending.abort();
+                assert!(pending.await.unwrap_err().is_cancelled());
+            } else {
+                let route = if mode == "retry" {
+                    "/failure"
+                } else {
+                    "/native_generate"
+                };
+                let response = router
+                    .route_typed_request(None, &request, route, None)
+                    .await;
+                if mode == "retry" {
+                    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+                    assert_eq!(workers.iter().map(|worker| worker.load()).sum::<usize>(), 1);
+                    response_text(response).await;
+                    assert_eq!(
+                        workers
+                            .iter()
+                            .map(|worker| worker.processed_requests())
+                            .sum::<usize>(),
+                        2
+                    );
+                } else if mode == "stream_error" {
+                    for (_, tx, _) in &backends {
+                        let _ = tx.send(Err(std::io::Error::other("backend stream failed")));
+                    }
+                    assert!(to_bytes(response.into_body(), 1024).await.is_err());
+                } else {
+                    assert_eq!(workers.iter().map(|worker| worker.load()).sum::<usize>(), 1);
+                    drop(response);
+                }
+            }
+            assert!(workers.iter().all(|worker| worker.load() == 0), "{mode}");
+            for (_, _, task) in backends {
+                task.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn headerless_chat_uses_healthy_workers_and_preserves_affinity_keys() {
+        let (router, backends) = stateless_fixture().await;
+        let workers = router.worker_registry.get_all();
+        workers[0].set_healthy(false);
+        let request = stateless_chat(false);
+        let response = router
+            .route_typed_request(None, &request, "/abort", None)
+            .await;
+        assert_eq!(response_text(response).await, workers[1].url());
+        assert!(workers.iter().all(|worker| worker.load() == 0));
+        workers[0].set_healthy(true);
+        for key in ["session", "other_header", "body", "empty_header"] {
+            let mut headers = HeaderMap::new();
+            let mut request = stateless_chat(false);
+            match key {
+                "session" => {
+                    headers.insert("x-session-id", HeaderValue::from_static("sticky"));
+                }
+                "other_header" => {
+                    headers.insert("x-user-id", HeaderValue::from_static("sticky"));
+                }
+                "empty_header" => {
+                    headers.insert("x-session-id", HeaderValue::from_static(""));
+                }
+                _ => {
+                    request.session_params =
+                        Some([("session_id".to_string(), serde_json::json!("sticky"))].into());
+                }
+            }
+            let first = response_text(
+                router
+                    .route_typed_request(Some(&headers), &request, "/abort", None)
+                    .await,
+            )
+            .await;
+            workers.iter().for_each(|worker| worker.increment_load());
+            let second = response_text(
+                router
+                    .route_typed_request(Some(&headers), &request, "/abort", None)
+                    .await,
+            )
+            .await;
+            assert_eq!(first, second, "{key}");
+            assert!(workers.iter().all(|worker| worker.load() == 1), "{key}");
+            workers.iter().for_each(|worker| worker.decrement_load());
+        }
+        for (_, _, task) in backends {
+            task.abort();
+        }
     }
 
     async fn response_text(response: Response) -> String {

@@ -5,7 +5,7 @@
 //! consistently routed to the same worker for better cache locality.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use tracing::debug;
 use tracing::info;
@@ -33,6 +33,7 @@ pub struct ConsistentHashPolicy {
     current_workers: RwLock<Vec<String>>,
     /// Opt-in sticky least-tokens placement of new sessions
     placement: Option<Arc<TokenPlacement>>,
+    stateless_selection: Mutex<()>,
 }
 
 impl ConsistentHashPolicy {
@@ -46,6 +47,7 @@ impl ConsistentHashPolicy {
             hash_ring: RwLock::new(BTreeMap::new()),
             current_workers: RwLock::new(Vec::new()),
             placement: placement.map(Arc::new),
+            stateless_selection: Mutex::new(()),
         }
     }
 
@@ -500,6 +502,26 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
         request_text: Option<&str>,
         headers: Option<&RequestHeaders>,
     ) -> Option<(usize, Option<SessionLease>)> {
+        // Typed chat requests expose empty routing text without session affinity.
+        // Preserve all explicit headers/body keys; reserve stateless load atomically.
+        if request_text.map_or(true, str::is_empty)
+            && !headers.is_some_and(|headers| headers.contains_key("x-session-id"))
+            && headers
+                .and_then(hash_key::extract_hash_key_from_headers)
+                .is_none()
+        {
+            let _selection = self.stateless_selection.lock().unwrap();
+            let idx = get_healthy_worker_indices(workers)
+                .into_iter()
+                .min_by_key(|&idx| (workers[idx].load(), workers[idx].processed_requests()))?;
+            let worker = Arc::clone(&workers[idx]);
+            worker.increment_load();
+            worker.increment_processed();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+            RouterMetrics::record_processed_request(worker.url());
+            RouterMetrics::record_policy_decision(self.name(), worker.url());
+            return Some((idx, Some(SessionLease::Stateless(worker))));
+        }
         let hash_key = hash_key::extract_hash_key(request_text, headers);
         if let Some(placement) = &self.placement {
             if !hash_key.starts_with("request") {
