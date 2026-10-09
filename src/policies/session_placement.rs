@@ -81,14 +81,23 @@ impl State {
 /// Keeps a session's owner while one routed request is in flight; dropping it
 /// settles the request and starts the session's idle clock.
 #[derive(Debug)]
-pub struct SessionLease {
-    placement: Arc<TokenPlacement>,
-    key: String,
+pub enum SessionLease {
+    Session {
+        placement: Arc<TokenPlacement>,
+        key: String,
+    },
+    Stateless(Arc<dyn crate::core::Worker>),
 }
 
 impl Drop for SessionLease {
     fn drop(&mut self) {
-        self.placement.settle_at(&self.key, Instant::now());
+        match self {
+            Self::Session { placement, key } => placement.settle_at(key, Instant::now()),
+            Self::Stateless(worker) => {
+                worker.decrement_load();
+                crate::metrics::RouterMetrics::set_running_requests(worker.url(), worker.load());
+            }
+        }
     }
 }
 
@@ -163,7 +172,7 @@ impl TokenPlacement {
         let mut state = self.state.lock().unwrap();
         let worker = self.place_locked(&mut state, key, request_text, healthy, now);
         state.sessions.get_mut(key).unwrap().inflight += 1;
-        let lease = SessionLease {
+        let lease = SessionLease::Session {
             placement: Arc::clone(self),
             key: key.to_string(),
         };
@@ -234,7 +243,7 @@ impl TokenPlacement {
         session.inflight += 1;
         session.last_seen = now;
         state.set_counted(key, true);
-        Some(SessionLease {
+        Some(SessionLease::Session {
             placement: Arc::clone(self),
             key: key.to_string(),
         })
@@ -318,7 +327,10 @@ mod tests {
     }
 
     fn settle(placement: &TokenPlacement, lease: SessionLease, now: Instant) {
-        placement.settle_at(&lease.key, now);
+        let SessionLease::Session { key, .. } = &lease else {
+            panic!("expected session lease")
+        };
+        placement.settle_at(key, now);
         std::mem::forget(lease);
     }
 
