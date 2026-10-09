@@ -2077,7 +2077,7 @@ mod tests {
         router_mut.policy_registry = Arc::new(PolicyRegistry::with_default_policy(Arc::new(
             crate::policies::ConsistentHashPolicy::with_placement(None),
         )));
-        router_mut.retry_config.max_retries = 1;
+        router_mut.retry_config.max_retries = 2;
         router_mut.retry_config.initial_backoff_ms = 1;
         (router, backends)
     }
