@@ -3,9 +3,11 @@ use crate::metrics::RouterMetrics;
 use async_trait::async_trait;
 use futures;
 use serde_json;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -14,6 +16,105 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .expect("Failed to create worker HTTP client")
 });
+
+#[derive(Clone, Debug)]
+pub(crate) struct SpillGauge {
+    pub model: String,
+    pub kv: f64,
+    pub waiting: f64,
+    expires: Instant,
+}
+static SPILL_GAUGES: LazyLock<dashmap::DashMap<(String, usize), SpillGauge>> =
+    LazyLock::new(dashmap::DashMap::new);
+
+pub(crate) fn spill_gauge(worker: &dyn Worker) -> Option<SpillGauge> {
+    let gauge =
+        SPILL_GAUGES.get(&(worker.base_url().to_string(), worker.dp_rank().unwrap_or(0)))?;
+    (worker.is_available()
+        && gauge.expires > Instant::now()
+        && (worker.model_id() == "unknown" || worker.model_id() == gauge.model))
+        .then(|| gauge.clone())
+}
+
+// Reject ambiguous model/rank joins, malformed labels, duplicates and invalid gauges.
+fn parse_spill_gauges(text: &str, expires: Instant) -> Option<HashMap<usize, SpillGauge>> {
+    static ROW: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+        r#"^vllm:(kv_cache_usage_perc|num_requests_waiting)\{(?:engine="([0-9]+)",model_name=("(?:[^"\\]|\\.)+")|model_name=("(?:[^"\\]|\\.)+"),engine="([0-9]+)")\}\s+(\S+)$"#).unwrap()
+    });
+    let mut rows = HashMap::<(String, usize), [Option<f64>; 2]>::new();
+    for line in text.lines().filter(|l| {
+        l.starts_with("vllm:kv_cache_usage_perc{") || l.starts_with("vllm:num_requests_waiting{")
+    }) {
+        let row = ROW.captures(line)?;
+        let field = usize::from(&row[1] == "num_requests_waiting");
+        let model: String = serde_json::from_str(row.get(3).or(row.get(4))?.as_str()).ok()?;
+        let engine = row.get(2).or(row.get(5))?.as_str().parse().ok()?;
+        let value = row[6].parse::<f64>().ok()?;
+        if !(0.0..=1.0).contains(&value) && field == 0
+            || (!value.is_finite() || value < 0.0 || value.fract() != 0.0) && field == 1
+        {
+            return None;
+        }
+        if rows.entry((model, engine)).or_default()[field]
+            .replace(value)
+            .is_some()
+        {
+            return None;
+        }
+    }
+    let model = rows.keys().next()?.0.clone();
+    if rows.keys().any(|(name, _)| name != &model) {
+        return None;
+    }
+    rows.into_iter()
+        .map(|((name, rank), values)| {
+            let gauge = SpillGauge {
+                model: name,
+                kv: values[0]?,
+                waiting: values[1]?,
+                expires,
+            };
+            Some((rank, gauge))
+        })
+        .collect()
+}
+
+pub(crate) async fn refresh_spill_gauges(workers: &[Arc<dyn Worker>], interval: u64) {
+    let mut origins = BTreeMap::new();
+    for worker in workers {
+        let timeout = worker.metadata().health_config.timeout_secs;
+        origins
+            .entry(worker.base_url())
+            .and_modify(|t: &mut u64| *t = (*t).min(timeout))
+            .or_insert(timeout);
+    }
+    futures::future::join_all(origins.into_iter().map(|(origin, timeout)| async move {
+        let result = async {
+            let text = WORKER_CLIENT
+                .get(format!("{origin}/metrics"))
+                .timeout(Duration::from_secs(timeout))
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?
+                .text()
+                .await
+                .ok()?;
+            let ttl = Duration::from_secs(interval.saturating_mul(2).max(1));
+            parse_spill_gauges(&text, Instant::now() + ttl)
+        }
+        .await;
+        SPILL_GAUGES.retain(|(url, _), _| url != origin);
+        if let Some(gauges) = result {
+            for (rank, gauge) in gauges {
+                SPILL_GAUGES.insert((origin.to_string(), rank), gauge);
+            }
+        }
+    }))
+    .await;
+}
 
 /// Core worker abstraction that represents a backend service
 #[async_trait]
@@ -950,6 +1051,9 @@ pub fn start_health_checker(
 
             // Execute all health checks concurrently
             futures::future::join_all(health_checks).await;
+            if crate::policies::session_placement::spill_threshold_env().is_some() {
+                refresh_spill_gauges(&workers_to_check, check_interval_secs).await;
+            }
         }
     });
 

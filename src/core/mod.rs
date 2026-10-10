@@ -19,6 +19,7 @@ pub use circuit_breaker::{
 };
 pub use error::{WorkerError, WorkerResult};
 pub use retry::{is_retryable_status, BackoffCalculator, RetryError, RetryExecutor};
+pub(crate) use worker::{refresh_spill_gauges, spill_gauge};
 pub use worker::{
     start_health_checker, BasicWorker, ConnectionMode, DPAwareWorker, HealthChecker, HealthConfig,
     Worker, WorkerCollection, WorkerFactory, WorkerLoadGuard, WorkerType,

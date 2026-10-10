@@ -1639,11 +1639,16 @@ impl RouterTrait for Router {
     }
 
     fn session_placement(&self) -> Response {
-        Json(serde_json::json!({
+        let policy = self.policy_registry.get_default_policy();
+        let mut metadata = serde_json::json!({
             "atomic_select_and_lease": true,
-            "placement": self.policy_registry.get_default_policy().session_placement(),
-        }))
-        .into_response()
+            "placement": policy.session_placement(),
+        });
+        if let Some(threshold) = policy.session_spill_kv_threshold() {
+            metadata["session_spill_kv_threshold"] = serde_json::json!(threshold);
+            metadata["logical_turn_header"] = serde_json::json!("x-router-logical-turn-id");
+        }
+        Json(metadata).into_response()
     }
 
     async fn get_worker_loads(&self) -> Response {
@@ -1993,6 +1998,9 @@ mod tests {
 
     /// Actual HTTP backend: the generation stream stays open until the sender is
     /// dropped; abort reports which backend received it.
+    static SPILL_METRICS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (String, usize)>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
     async fn placement_backend() -> (
         String,
         tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
@@ -2003,7 +2011,36 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let rx = Arc::new(tokio::sync::Mutex::new(Some(rx)));
         let backend_url = url.clone();
+        let identity = {
+            let url = url.clone();
+            move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                let url = url.clone();
+                async move {
+                    assert!(body.get("router_logical_turn_id").is_none());
+                    match headers.get("x-data-parallel-rank") {
+                        Some(rank) => format!("{url}@{}", rank.to_str().unwrap()),
+                        None => url,
+                    }
+                }
+            }
+        };
         let app = axum::Router::new()
+            .route(
+                "/metrics",
+                axum::routing::get({
+                    let url = url.clone();
+                    move || {
+                        let url = url.clone();
+                        async move {
+                            let mut metrics = SPILL_METRICS.lock().unwrap();
+                            let (text, count) = metrics.get_mut(&url).unwrap();
+                            *count += 1;
+                            text.clone()
+                        }
+                    }
+                }),
+            )
+            .route("/spill_echo", axum::routing::post(identity.clone()))
             .route(
                 "/native_generate",
                 axum::routing::post(move || {
@@ -2016,16 +2053,7 @@ mod tests {
                     }
                 }),
             )
-            .route(
-                "/abort",
-                axum::routing::post({
-                    let url = url.clone();
-                    move || {
-                        let url = url.clone();
-                        async move { url }
-                    }
-                }),
-            )
+            .route("/abort", axum::routing::post(identity))
             .route(
                 "/failure",
                 axum::routing::post(|| async { StatusCode::BAD_GATEWAY }),
@@ -2065,6 +2093,150 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-session-id", HeaderValue::from_static("generation"));
         headers
+    }
+
+    #[tokio::test]
+    async fn native_hash_spill_metrics_turns_leases_and_late_abort() {
+        async fn echo(router: &Router, headers: &HeaderMap, id: &str) -> String {
+            let body = serde_json::json!({"prompt_ids":[1,2], "request_id":id});
+            response_text(
+                router
+                    .route_transparent(Some(headers), "/spill_echo", &Method::POST, body)
+                    .await,
+            )
+            .await
+        }
+        let backends = vec![placement_backend().await, placement_backend().await];
+        let mut router = create_test_regular_router();
+        router.intra_node_data_parallel_size = 2;
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, _, _) in &backends {
+            for rank in 0..2 {
+                let worker = DPAwareWorker::new(url.clone(), rank, 2, WorkerType::Regular);
+                router.worker_registry.register(Arc::new(worker));
+            }
+        }
+        let workers = router.worker_registry.get_all();
+        let mut placement = crate::policies::TokenPlacement::new(Duration::from_secs(900));
+        placement.spill_threshold = Some(0.95);
+        let policy = Arc::new(crate::policies::ConsistentHashPolicy::with_placement(Some(
+            placement,
+        )));
+        router.policy_registry = Arc::new(PolicyRegistry::with_default_policy(policy.clone()));
+        let mut headers = placement_headers();
+        headers.insert("x-router-logical-turn-id", HeaderValue::from_static("t0"));
+        let generation = |id: &str| serde_json::json!({"prompt_ids":[1,2], "request_id":id});
+        let owner = echo(&router, &headers, "r0").await;
+        let request_headers = Router::headers_to_request_headers(Some(&headers)).unwrap();
+        let hash = crate::policies::ConsistentHashPolicy::with_placement(None);
+        let index = hash
+            .select_worker_with_headers(
+                &workers,
+                Some(&generation("r0").to_string()),
+                Some(&request_headers),
+            )
+            .unwrap();
+        assert_eq!(owner, workers[index].url());
+        let metrics = |url: &str| {
+            (0..2).rev().map(|rank| {
+            let hot = format!("{url}@{rank}") == owner;
+            format!("vllm:num_requests_waiting{{engine=\"{rank}\",model_name=\"m\"}} {}\nvllm:kv_cache_usage_perc{{model_name=\"m\",engine=\"{rank}\"}} {}\n", if hot {2} else {0}, if hot {0.99} else {0.1})
+        }).collect::<String>()
+        };
+        for (url, _, _) in &backends {
+            SPILL_METRICS
+                .lock()
+                .unwrap()
+                .insert(url.clone(), (metrics(url), 0));
+        }
+        crate::core::refresh_spill_gauges(&workers, 30).await;
+        assert!(backends
+            .iter()
+            .all(|(u, _, _)| SPILL_METRICS.lock().unwrap()[u].1 == 1));
+        for worker in &workers {
+            let gauge = crate::core::spill_gauge(worker.as_ref()).unwrap();
+            assert_eq!(gauge.waiting > 0.0, worker.url() == owner);
+        }
+        let stream = router
+            .route_transparent(
+                Some(&headers),
+                "/native_generate",
+                &Method::POST,
+                generation("stream"),
+            )
+            .await;
+        headers.insert("x-router-logical-turn-id", HeaderValue::from_static("busy"));
+        assert_eq!(echo(&router, &headers, "busy").await, owner);
+        drop(stream);
+        assert_eq!(echo(&router, &headers, "resume").await, owner);
+        headers.remove("x-router-logical-turn-id");
+        assert_eq!(echo(&router, &headers, "missing").await, owner);
+        headers.insert(
+            "x-router-logical-turn-id",
+            HeaderValue::from_static("bad marker"),
+        );
+        assert_eq!(echo(&router, &headers, "invalid").await, owner);
+        let origin = owner.rsplit_once('@').unwrap().0;
+        let valid = metrics(origin);
+        for invalid in [
+            valid.lines().next().unwrap().to_string(),
+            format!("{valid}{valid}"),
+            valid.replace("0.99", "NaN"),
+            valid.replace("0.99", "+Inf"),
+            valid.replace("0.99", "0.94"),
+            valid.replacen("} 2", "} 0", 1),
+            valid.replacen("\"m\"", "\"other\"", 1),
+        ] {
+            SPILL_METRICS.lock().unwrap().get_mut(origin).unwrap().0 = invalid;
+            crate::core::refresh_spill_gauges(&workers, 30).await;
+            assert!(workers.iter().all(|w| w.is_healthy()));
+            let id = uuid::Uuid::new_v4().to_string();
+            let marker = HeaderValue::from_str(&id).unwrap();
+            headers.insert("x-router-logical-turn-id", marker);
+            assert_eq!(echo(&router, &headers, &id).await, owner);
+        }
+        SPILL_METRICS.lock().unwrap().get_mut(origin).unwrap().0 = valid;
+        crate::core::refresh_spill_gauges(&workers, 0).await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        headers.insert(
+            "x-router-logical-turn-id",
+            HeaderValue::from_static("stale"),
+        );
+        assert_eq!(echo(&router, &headers, "stale").await, owner);
+        crate::core::refresh_spill_gauges(&workers, 30).await;
+        let mut reserved = crate::policies::TokenPlacement::new(Duration::from_secs(900));
+        reserved.spill_threshold = Some(0.95);
+        let reserved = Arc::new(reserved);
+        let reserve = |key, turn| {
+            let body = generation(turn).to_string();
+            reserved.hash_and_lease(key, Some(&body), Some(turn), &owner, &workers)
+        };
+        for key in ["a", "b"] {
+            drop(reserve(key, "old").1);
+        }
+        let ((a, first), (b, second)) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| reserve("a", "new"));
+            let second = scope.spawn(|| reserve("b", "new"));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_ne!(a, b);
+        drop((first, second));
+        headers.insert("x-router-logical-turn-id", HeaderValue::from_static("next"));
+        let next = echo(&router, &headers, "next").await;
+        assert_ne!(next, owner);
+        headers.remove("x-router-logical-turn-id");
+        let body = serde_json::json!({"request_id":"stream"});
+        let abort = router
+            .route_transparent(Some(&headers), "/abort", &Method::POST, body)
+            .await;
+        assert_eq!(response_text(abort).await, owner);
+        headers.insert("x-router-logical-turn-id", HeaderValue::from_static("busy"));
+        assert_eq!(echo(&router, &headers, "late-resume").await, owner);
+        headers.insert("x-router-logical-turn-id", HeaderValue::from_static("next"));
+        assert_eq!(echo(&router, &headers, "next-retry").await, next);
+        for (_, _, task) in backends {
+            task.abort();
+        }
     }
 
     async fn stateless_fixture() -> (

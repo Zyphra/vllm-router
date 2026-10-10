@@ -28,6 +28,16 @@ use std::time::{Duration, Instant};
 
 pub const PLACEMENT_ENV: &str = "VLLM_ROUTER_SESSION_PLACEMENT";
 pub const IDLE_SECS_ENV: &str = "VLLM_ROUTER_SESSION_IDLE_SECS";
+pub const SPILL_ENV: &str = "VLLM_ROUTER_SESSION_SPILL_KV_THRESHOLD";
+pub fn spill_threshold_env() -> Option<f64> {
+    let value = std::env::var(SPILL_ENV).ok().filter(|v| !v.is_empty())?;
+    let threshold: f64 = value.parse().expect("spill threshold must be numeric");
+    assert!(
+        threshold.is_finite() && threshold > 0.0 && threshold <= 1.0,
+        "{SPILL_ENV} must be finite and in (0, 1]"
+    );
+    Some(threshold)
+}
 const DEFAULT_IDLE_SECS: u64 = 900;
 const RETAIN_IDLE_PERIODS: u32 = 4;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -42,9 +52,13 @@ struct Session {
     inflight: u32,
     /// Set by `release_owners`: re-place on the next request made while idle.
     released: bool,
+    turns: HashMap<String, String>,
+    requests: HashMap<String, String>,
 }
 
-/// Ordered by tokens first, then by session count as the tie-break.
+/// Sticky affinity reservations, ordered by tokens then session count. A late
+/// request for an earlier turn leases the session but keeps its current affinity
+/// reservation; backend pressure comes from the native per-engine gauges.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Load {
     tokens: u64,
@@ -105,6 +119,7 @@ impl Drop for SessionLease {
 #[derive(Debug)]
 pub struct TokenPlacement {
     idle: Duration,
+    pub spill_threshold: Option<f64>,
     state: Mutex<State>,
 }
 
@@ -112,6 +127,7 @@ impl TokenPlacement {
     pub fn new(idle: Duration) -> Self {
         Self {
             idle,
+            spill_threshold: None,
             state: Mutex::new(State {
                 sessions: HashMap::new(),
                 loads: HashMap::new(),
@@ -122,9 +138,14 @@ impl TokenPlacement {
 
     /// Build from the environment; `None` keeps plain consistent hashing.
     pub fn from_env() -> Option<Self> {
+        let spill = spill_threshold_env();
         match std::env::var(PLACEMENT_ENV).ok().as_deref() {
-            None | Some("") | Some("hash") => None,
-            Some("least_tokens") => {
+            None | Some("") | Some("hash") if spill.is_none() => None,
+            mode @ (None | Some("") | Some("hash") | Some("least_tokens")) => {
+                assert!(
+                    spill.is_none() || mode != Some("least_tokens"),
+                    "session spill requires hash placement"
+                );
                 let idle = match std::env::var(IDLE_SECS_ENV).ok().as_deref() {
                     None | Some("") => DEFAULT_IDLE_SECS,
                     Some(value) => match value.parse::<u64>() {
@@ -132,7 +153,9 @@ impl TokenPlacement {
                         _ => panic!("{IDLE_SECS_ENV} must be a positive integer, got {value:?}"),
                     },
                 };
-                Some(Self::new(Duration::from_secs(idle)))
+                let mut placement = Self::new(Duration::from_secs(idle));
+                placement.spill_threshold = spill;
+                Some(placement)
             }
             Some(other) => {
                 panic!("{PLACEMENT_ENV} must be 'hash' or 'least_tokens', got {other:?}")
@@ -179,6 +202,91 @@ impl TokenPlacement {
         (worker, lease)
     }
 
+    /// Hash placement with spill only at an unseen, settled logical turn.
+    /// Physical and turn histories retain their exact owner through the existing
+    /// session retention period, including after response cancellation or spill.
+    pub fn hash_and_lease(
+        self: &Arc<Self>,
+        key: &str,
+        text: Option<&str>,
+        turn: Option<&str>,
+        initial: &str,
+        workers: &[Arc<dyn crate::core::Worker>],
+    ) -> (String, SessionLease) {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        self.sweep(&mut state, now);
+        let body =
+            serde_json::from_str::<serde_json::Value>(text.unwrap_or("null")).unwrap_or_default();
+        let request = body["request_id"].as_str();
+        let generation = body["prompt_ids"].is_array();
+        let turn = turn.filter(|t| {
+            !t.is_empty()
+                && t.len() <= 128
+                && t.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+        });
+        let session = state.sessions.entry(key.to_string()).or_insert(Session {
+            worker: initial.to_string(),
+            tokens: 0,
+            last_seen: now,
+            counted: false,
+            inflight: 0,
+            released: false,
+            turns: HashMap::new(),
+            requests: HashMap::new(),
+        });
+        let prior = request
+            .and_then(|r| session.requests.get(r))
+            .cloned()
+            .or_else(|| turn.and_then(|t| session.turns.get(t)).cloned());
+        let eligible = generation
+            && prior.is_none()
+            && turn.is_some()
+            && !session.turns.is_empty()
+            && session.inflight == 0;
+        let mut target = prior.unwrap_or_else(|| session.worker.clone());
+        if eligible {
+            let hot = workers
+                .iter()
+                .find(|w| w.url() == target)
+                .and_then(|w| crate::core::spill_gauge(w.as_ref()));
+            let threshold = self.spill_threshold.unwrap();
+            if let Some(hot) = hot.filter(|g| g.kv >= threshold && g.waiting > 0.0) {
+                target = workers
+                    .iter()
+                    .filter(|w| {
+                        crate::core::spill_gauge(w.as_ref()).is_some_and(|g| {
+                            g.model == hot.model && g.waiting == 0.0 && g.kv < threshold
+                        })
+                    })
+                    .min_by_key(|w| state.loads.get(w.url()).copied().unwrap_or_default())
+                    .map(|w| w.url().to_string())
+                    .unwrap_or(target);
+            }
+        }
+        state.set_counted(key, false);
+        let session = state.sessions.get_mut(key).unwrap();
+        if generation && request.is_none_or(|r| !session.requests.contains_key(r)) {
+            if let Some(turn) = turn.filter(|t| !session.turns.contains_key(*t)) {
+                session.worker = target.clone();
+                session.turns.insert(turn.to_string(), target.clone());
+            }
+            if let Some(request) = request {
+                session.requests.insert(request.to_string(), target.clone());
+            }
+        }
+        session.tokens = session.tokens.max(prompt_token_count(text).unwrap_or(0));
+        session.inflight += 1;
+        session.last_seen = now;
+        state.set_counted(key, true);
+        let lease = SessionLease::Session {
+            placement: Arc::clone(self),
+            key: key.to_string(),
+        };
+        (target, lease)
+    }
+
     fn place_locked(
         &self,
         state: &mut State,
@@ -211,6 +319,8 @@ impl TokenPlacement {
                 counted: false,
                 inflight: 0,
                 released: false,
+                turns: HashMap::new(),
+                requests: HashMap::new(),
             });
             session.worker = worker;
             session.released = false;

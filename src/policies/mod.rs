@@ -17,7 +17,7 @@ mod random;
 mod registry;
 mod rendezvous_hash;
 mod round_robin;
-mod session_placement;
+pub(crate) mod session_placement;
 
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hash::ConsistentHashPolicy;
@@ -114,6 +114,9 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Effective session placement mode, for capability admission.
     fn session_placement(&self) -> &'static str {
         "hash"
+    }
+    fn session_spill_kv_threshold(&self) -> Option<f64> {
+        None
     }
 
     /// Forget session ownership because every worker's prefix cache was reset

@@ -372,7 +372,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
         // Session keys go to their sticky worker, or a new session to the healthy
         // worker holding the fewest context tokens. Keyless requests keep hashing.
         if let Some(placement) = &self.placement {
-            if !hash_key.starts_with("request") {
+            if placement.spill_threshold.is_none() && !hash_key.starts_with("request") {
                 let healthy: Vec<&str> = healthy_indices
                     .iter()
                     .map(|&idx| workers[idx].url())
@@ -533,7 +533,24 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
                     .iter()
                     .map(|&idx| workers[idx].url())
                     .collect();
-                let (target, lease) = placement.place_and_lease(&hash_key, request_text, &healthy);
+                let (target, lease) = if placement.spill_threshold.is_some() {
+                    self.update_hash_ring(workers);
+                    let initial = self
+                        .find_worker_by_hash(&hash_key)
+                        .filter(|url| healthy.contains(&url.as_str()))
+                        .unwrap_or_else(|| healthy[0].to_string());
+                    placement.hash_and_lease(
+                        &hash_key,
+                        request_text,
+                        headers
+                            .and_then(|h| h.get("x-router-logical-turn-id"))
+                            .map(String::as_str),
+                        &initial,
+                        workers,
+                    )
+                } else {
+                    placement.place_and_lease(&hash_key, request_text, &healthy)
+                };
                 let idx = healthy_indices
                     .into_iter()
                     .find(|&idx| workers[idx].url() == target)?;
@@ -548,11 +565,18 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
     }
 
     fn session_placement(&self) -> &'static str {
-        if self.placement.is_some() {
+        if self
+            .placement
+            .as_ref()
+            .is_some_and(|p| p.spill_threshold.is_none())
+        {
             "least_tokens"
         } else {
             "hash"
         }
+    }
+    fn session_spill_kv_threshold(&self) -> Option<f64> {
+        self.placement.as_ref().and_then(|p| p.spill_threshold)
     }
 
     fn name(&self) -> &'static str {

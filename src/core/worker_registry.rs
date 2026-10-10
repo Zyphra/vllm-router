@@ -387,6 +387,9 @@ impl WorkerRegistry {
                 for worker in &workers {
                     let _ = worker.check_health_async().await; // Use async version directly
                 }
+                if crate::policies::session_placement::spill_threshold_env().is_some() {
+                    crate::core::refresh_spill_gauges(&workers, check_interval_secs).await;
+                }
 
                 // Reset loads periodically
                 check_count += 1;
