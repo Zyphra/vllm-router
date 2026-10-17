@@ -210,8 +210,9 @@ impl Router {
                         "Native generation cancelled before dispatch",
                     );
                 }
-                // Setting the active physical owner and starting its dispatch is
-                // one cancellation transaction. Abort can never trigger a retry.
+                // Publish the physical owner before dispatch. A racing abort
+                // before native registration must return false, preserving
+                // unknown delivery; an abort ACK never authorizes a retry.
                 state.worker = Some(worker.clone());
                 state.admission = Admission::Unknown;
             }
@@ -438,6 +439,7 @@ mod tests {
         health_release: Arc<Notify>,
         block_health: bool,
         block_other_requests: bool,
+        reject_early_abort: bool,
         delay: Duration,
     }
 
@@ -507,8 +509,8 @@ mod tests {
             .route(ABORT, axum::routing::post(move |Json(body): Json<serde_json::Value>| {
                 let calls = calls.clone(); async move {
                     calls.abort.fetch_add(1, Ordering::SeqCst);
-                    calls.release.notify_one();
-                    Json(serde_json::json!({"request_id": body["request_id"], "aborted": true}))
+                    if !calls.reject_early_abort { calls.release.notify_one(); }
+                    Json(serde_json::json!({"request_id": body["request_id"], "aborted": !calls.reject_early_abort}))
                 }
             }));
         let handle = tokio::spawn(async move {
@@ -596,6 +598,52 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (url, handle)
+    }
+
+    #[tokio::test]
+    async fn abort_before_dispatch_cannot_settle_unregistered_native_request() {
+        let calls = Calls {
+            reject_early_abort: true,
+            ..Calls::default()
+        };
+        let other_calls = Calls::default();
+        let (primary, primary_task) = backend(Behavior::Block, true, calls.clone()).await;
+        let (secondary, secondary_task) =
+            backend(Behavior::Success, true, other_calls.clone()).await;
+        let router = router(&[primary.clone(), secondary], 1, Duration::from_secs(2));
+        let (headers, body) = request(&router, &primary, "before-dispatch");
+        let mut generation = Box::pin(router.route_transparent(
+            Some(&headers),
+            GENERATE,
+            &Method::POST,
+            body.clone(),
+        ));
+        // The first poll publishes Unknown ownership and parks in the fresh
+        // connection future. Do not poll it again before forwarding the abort.
+        assert!(futures::poll!(generation.as_mut()).is_pending());
+        let owner = router.native_retry.owners.lock()["before-dispatch"].clone();
+        assert_eq!(owner.lock().admission, Admission::Unknown);
+        let aborted = router
+            .route_transparent(Some(&headers), ABORT, &Method::POST, body)
+            .await;
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&to_bytes(aborted.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(receipt["aborted"], false);
+        assert_eq!(calls.generate.load(Ordering::SeqCst), 0);
+        assert_eq!(other_calls.generate.load(Ordering::SeqCst), 0);
+        assert!(owner.lock().cancelled);
+        assert!(!owner.lock().abort_confirmed);
+        drop(generation);
+        assert!(owner.lock().forwarding_done);
+        assert!(router
+            .native_retry
+            .owners
+            .lock()
+            .contains_key("before-dispatch"));
+        assert_eq!(owner.lock().worker.as_ref().unwrap().url(), primary);
+        primary_task.abort();
+        secondary_task.abort();
     }
 
     #[tokio::test]
