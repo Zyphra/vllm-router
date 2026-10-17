@@ -284,6 +284,10 @@ struct CliArgs {
     #[arg(long, default_value_t = false)]
     disable_retries: bool,
 
+    /// Native generation retries, only after proven pre-admission failure
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=1))]
+    native_pre_admission_retries: u8,
+
     // Circuit breaker configuration
     /// Number of failures before circuit breaker opens
     #[arg(long, default_value_t = 10)]
@@ -544,6 +548,7 @@ impl CliArgs {
                 window_duration_secs: self.cb_window_duration_secs,
             },
             disable_retries: self.disable_retries,
+            native_pre_admission_retries: self.native_pre_admission_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             health_check: HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
