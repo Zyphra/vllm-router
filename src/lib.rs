@@ -213,6 +213,7 @@ impl Router {
                 window_duration_secs: self.cb_window_duration_secs,
             },
             disable_retries: self.disable_retries,
+            native_pre_admission_retries: 0,
             disable_circuit_breaker: self.disable_circuit_breaker,
             health_check: config::HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,

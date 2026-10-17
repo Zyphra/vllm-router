@@ -19,6 +19,14 @@ impl ConfigValidator {
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
+        if config.native_pre_admission_retries > 1
+            || (config.native_pre_admission_retries != 0
+                && !matches!(config.mode, RoutingMode::Regular { .. }))
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "native_pre_admission_retries must be 0 or 1 and requires regular routing".to_string(),
+            });
+        }
 
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;

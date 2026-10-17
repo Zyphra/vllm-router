@@ -1,3 +1,5 @@
+mod native_retry;
+
 use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
@@ -42,6 +44,7 @@ pub struct Router {
     intra_node_data_parallel_size: usize,
     api_key: Option<String>,
     retry_config: RetryConfig,
+    native_retry: native_retry::NativeRetry,
     circuit_breaker_config: CircuitBreakerConfig,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
@@ -178,6 +181,7 @@ impl Router {
             intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
+            native_retry: native_retry::NativeRetry::new(ctx.router_config.native_pre_admission_retries, Duration::from_secs(ctx.router_config.request_timeout_secs)),
             circuit_breaker_config: core_cb_config,
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
@@ -1704,6 +1708,14 @@ impl RouterTrait for Router {
         method: &Method,
         body: serde_json::Value,
     ) -> Response {
+        if self.native_retry.enabled() && *method == Method::POST {
+            match path {
+                "/verl/v1/generate" => return self.route_native_generate(headers, body).await,
+                "/verl/v1/abort" => return self.route_native_abort(headers, body).await,
+                _ => {}
+            }
+        }
+
         debug!("Transparent proxy: routing {} {} to backend", method, path);
 
         // Select a worker (filter by availability like select_worker_for_model)
@@ -1858,6 +1870,7 @@ mod tests {
             api_key: None,
             client: Client::new(),
             retry_config: RetryConfig::default(),
+            native_retry: native_retry::NativeRetry::new(0, Duration::from_secs(1800)),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
@@ -1985,6 +1998,7 @@ mod tests {
             api_key: None,
             client: Client::new(),
             retry_config: RetryConfig::default(),
+            native_retry: native_retry::NativeRetry::new(0, Duration::from_secs(1800)),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
