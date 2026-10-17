@@ -90,6 +90,15 @@ class RouterArgs:
     pool_idle_timeout_secs: int = 4
     native_pre_admission_retries: int = 0
 
+    def __post_init__(self):
+        retries = self.native_pre_admission_retries
+        if type(retries) is not int or retries not in (0, 1):
+            raise ValueError("native_pre_admission_retries must be 0 or 1")
+        if retries and (self.mini_lb or self.vllm_pd_disaggregation):
+            raise ValueError(
+                "native pre-admission retries require regular Rust routing"
+            )
+
     @staticmethod
     def add_cli_args(
         parser: argparse.ArgumentParser,

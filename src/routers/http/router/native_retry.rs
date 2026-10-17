@@ -246,7 +246,7 @@ impl Router {
                     } else {
                         // Native /generate sends successful response headers only
                         // after generation has finished. Other errors stay unknown.
-                        if response.status().is_success() {
+                        if response.status() == StatusCode::OK {
                             owner.lock().admission = Admission::Completed;
                         }
                         return stream_response(response, leases);
@@ -288,13 +288,14 @@ impl Router {
             }
             // A DP rank on the same endpoint is not an independent replica.
             // Probe one distinct available worker; this is not a search loop.
-            let alternate = workers
-                .iter()
+            let alternate = self
+                .worker_registry
+                .get_all()
+                .into_iter()
                 .filter(|candidate| {
                     candidate.is_available() && candidate.base_url() != worker.base_url()
                 })
-                .min_by_key(|candidate| candidate.load())
-                .cloned();
+                .min_by_key(|candidate| candidate.load());
             let Some(alternate) = alternate else {
                 return error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -388,7 +389,7 @@ impl Router {
         )
         .await;
         match response {
-            Ok(response) if response.status().is_success() => {
+            Ok(response) if response.status() == StatusCode::OK => {
                 match response.json::<serde_json::Value>().await {
                     Ok(receipt)
                         if receipt.get("aborted").and_then(|v| v.as_bool()) == Some(true)
@@ -921,5 +922,100 @@ mod tests {
         assert_eq!(calls.abort.load(Ordering::SeqCst), 0);
         assert!(router.native_retry.owners.lock().is_empty());
         primary_task.abort();
+    }
+    #[tokio::test]
+    async fn cancelled_forwarding_keeps_the_secondary_address_for_abort() {
+        let first = Calls::default();
+        let second = Calls::default();
+        let (primary, primary_task) = backend(Behavior::Reject, true, first.clone()).await;
+        let (secondary, secondary_task) = backend(Behavior::Block, true, second.clone()).await;
+        let router = Arc::new(router(
+            &[primary.clone(), secondary.clone()],
+            1,
+            Duration::from_secs(2),
+        ));
+        let (headers, body) = request(&router, &primary, "dropped-forwarder");
+        let generation_router = router.clone();
+        let generation_headers = headers.clone();
+        let generation_body = body.clone();
+        let generation = tokio::spawn(async move {
+            generation_router
+                .route_transparent(
+                    Some(&generation_headers),
+                    GENERATE,
+                    &Method::POST,
+                    generation_body,
+                )
+                .await
+        });
+        second.entered.notified().await;
+        generation.abort();
+        assert!(generation.await.unwrap_err().is_cancelled());
+        let owner = router.native_retry.owners.lock()["dropped-forwarder"].clone();
+        assert_eq!(owner.lock().worker.as_ref().unwrap().url(), secondary);
+        let abort = router
+            .route_transparent(Some(&headers), ABORT, &Method::POST, body)
+            .await;
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&to_bytes(abort.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(receipt["aborted"], true);
+        assert_eq!(second.abort.load(Ordering::SeqCst), 1);
+        assert_eq!(first.abort.load(Ordering::SeqCst), 0);
+        assert!(router.native_retry.owners.lock().is_empty());
+        primary_task.abort();
+        secondary_task.abort();
+    }
+
+    #[tokio::test]
+    async fn truncated_token_response_is_never_retried() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary = format!("http://{}", listener.local_addr().unwrap());
+        let connection = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"token_ids\":[42]").await.unwrap();
+        });
+        let calls = Calls::default();
+        let (secondary, secondary_task) = backend(Behavior::Success, true, calls.clone()).await;
+        let router = router(&[primary.clone(), secondary], 1, Duration::from_secs(2));
+        let (headers, body) = request(&router, &primary, "partial-token-body");
+        let response = router
+            .route_transparent(Some(&headers), GENERATE, &Method::POST, body)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(to_bytes(response.into_body(), usize::MAX).await.is_err());
+        connection.await.unwrap();
+        assert_eq!(calls.generate.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.health.load(Ordering::SeqCst), 0);
+        secondary_task.abort();
+    }
+
+    #[tokio::test]
+    async fn token_placement_is_rejected_only_when_native_retry_is_selected() {
+        use crate::policies::{ConsistentHashPolicy, TokenPlacement};
+        for retries in [0, 1] {
+            let config = crate::config::RouterConfig {
+                native_pre_admission_retries: retries,
+                ..Default::default()
+            };
+            let mut context =
+                crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap();
+            context.policy_registry = Arc::new(PolicyRegistry::with_default_policy(Arc::new(
+                ConsistentHashPolicy::with_placement(Some(TokenPlacement::new(
+                    Duration::from_secs(900),
+                ))),
+            )));
+            let result = Router::new(vec![], &Arc::new(context)).await;
+            if retries == 0 {
+                assert!(result.is_ok());
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .contains("require hash session placement"));
+            }
+        }
     }
 }

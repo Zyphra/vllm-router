@@ -57,6 +57,12 @@ impl Router {
         worker_urls: Vec<String>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
+        if ctx.router_config.native_pre_admission_retries != 0
+            && ctx.policy_registry.get_default_policy().session_placement() != "hash"
+        {
+            return Err("native pre-admission retries require hash session placement".to_string());
+        }
+
         // Update active workers gauge
         RouterMetrics::set_active_workers(worker_urls.len());
 
