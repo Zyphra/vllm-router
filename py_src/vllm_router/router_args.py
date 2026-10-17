@@ -33,9 +33,7 @@ class RouterArgs:
     eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
-    intra_node_data_parallel_size: int = (
-        1  # Intra-node data parallel size (DP-aware routing automatically enabled when > 1)
-    )
+    intra_node_data_parallel_size: int = 1  # Intra-node data parallel size (DP-aware routing automatically enabled when > 1)
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
@@ -90,6 +88,7 @@ class RouterArgs:
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
     pool_idle_timeout_secs: int = 4
+    native_pre_admission_retries: int = 0
 
     @staticmethod
     def add_cli_args(
@@ -391,6 +390,13 @@ class RouterArgs:
             action="store_true",
             help="Disable retries (equivalent to setting retry_max_retries=1)",
         )
+        parser.add_argument(
+            f"--{prefix}native-pre-admission-retries",
+            type=int,
+            choices=(0, 1),
+            default=RouterArgs.native_pre_admission_retries,
+            help="Retry one proven pre-admission native generation failure on another healthy replica",
+        )
         # Circuit breaker configuration
         parser.add_argument(
             f"--{prefix}cb-failure-threshold",
@@ -578,7 +584,6 @@ class RouterArgs:
 
         prefill_urls = []
         for prefill_args in prefill_list:
-
             url = prefill_args[0]
 
             # Handle optional bootstrap port

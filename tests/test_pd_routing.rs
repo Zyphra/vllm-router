@@ -121,7 +121,7 @@ mod test_pd_routing {
                 retry: RetryConfig::default(),
                 circuit_breaker: CircuitBreakerConfig::default(),
                 disable_retries: false,
-            native_pre_admission_retries: 0,
+                native_pre_admission_retries: 0,
                 disable_circuit_breaker: false,
                 health_check: vllm_router_rs::config::HealthCheckConfig::default(),
                 enable_igw: false,

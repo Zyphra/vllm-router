@@ -24,7 +24,8 @@ impl ConfigValidator {
                 && !matches!(config.mode, RoutingMode::Regular { .. }))
         {
             return Err(ConfigError::ValidationFailed {
-                reason: "native_pre_admission_retries must be 0 or 1 and requires regular routing".to_string(),
+                reason: "native_pre_admission_retries must be 0 or 1 and requires regular routing"
+                    .to_string(),
             });
         }
 
