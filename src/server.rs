@@ -885,9 +885,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .tcp_nodelay(true)
-        .tcp_keepalive(Some(Duration::from_secs(30)))
-        .build()
-        .expect("Failed to create HTTP client");
+        .tcp_keepalive(Some(Duration::from_secs(30)));
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    let client = client.tcp_user_timeout(Some(Duration::from_secs(
+        config.request_timeout_secs.max(600),
+    )));
+    let client = client.build().expect("Failed to create HTTP client");
     println!("DEBUG: HTTP client created");
 
     // Create the application context with all dependencies
