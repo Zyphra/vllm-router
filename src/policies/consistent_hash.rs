@@ -31,22 +31,25 @@ pub struct ConsistentHashPolicy {
     hash_ring: RwLock<BTreeMap<u64, String>>,
     /// Current set of workers (for detecting changes)
     current_workers: RwLock<Vec<String>>,
-    /// Opt-in sticky least-tokens placement of new sessions
-    placement: Option<Arc<TokenPlacement>>,
+    /// Session tracking; places new sessions by least tokens once enabled
+    placement: Arc<TokenPlacement>,
     stateless_selection: Mutex<()>,
 }
 
 impl ConsistentHashPolicy {
     pub fn new() -> Self {
-        Self::with_placement(TokenPlacement::from_env())
+        Self::with_placement(Some(TokenPlacement::from_env()))
     }
 
-    /// Build with explicit session placement; `None` is plain consistent hashing.
+    /// Build with explicit session placement; `None` is consistent hashing that
+    /// tracks sessions so least-tokens placement can be enabled at runtime.
     pub fn with_placement(placement: Option<TokenPlacement>) -> Self {
         Self {
             hash_ring: RwLock::new(BTreeMap::new()),
             current_workers: RwLock::new(Vec::new()),
-            placement: placement.map(Arc::new),
+            placement: Arc::new(placement.unwrap_or_else(|| {
+                TokenPlacement::tracking(super::session_placement::DEFAULT_IDLE)
+            })),
             stateless_selection: Mutex::new(()),
         }
     }
@@ -336,65 +339,17 @@ impl ConsistentHashPolicy {
         }
         (worker_url.to_string(), None)
     }
-}
 
-impl LoadBalancingPolicy for ConsistentHashPolicy {
-    fn select_worker_with_headers(
+    /// The hash ring's worker for `hash_key`, falling back to the first healthy
+    /// worker; records the processed-request metrics of the choice.
+    fn hash_select(
         &self,
         workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-        headers: Option<&RequestHeaders>,
+        healthy_indices: &[usize],
+        hash_key: &str,
     ) -> Option<usize> {
-        let healthy_indices = get_healthy_worker_indices(workers);
-
-        if healthy_indices.is_empty() {
-            return None;
-        }
-
-        // Update hash ring if needed
-        self.update_hash_ring(workers);
-
-        // Extract hash key with priority: headers > body > fallback
-        let hash_key = hash_key::extract_hash_key(request_text, headers);
-
-        // DEBUG: Log the request text and extracted hash key
-        if let Some(text) = request_text {
-            debug!("CONSISTENT_HASH_DEBUG: Request text length: {}", text.len());
-        }
-        if let Some(hdrs) = headers {
-            debug!(
-                "CONSISTENT_HASH_DEBUG: Headers available: {:?}",
-                hdrs.keys().collect::<Vec<_>>()
-            );
-        }
-        info!("CONSISTENT_HASH_DEBUG: Extracted hash key: {}", hash_key);
-
-        // Session keys go to their sticky worker, or a new session to the healthy
-        // worker holding the fewest context tokens. Keyless requests keep hashing.
-        if let Some(placement) = &self.placement {
-            if !hash_key.starts_with("request") {
-                let healthy: Vec<&str> = healthy_indices
-                    .iter()
-                    .map(|&idx| workers[idx].url())
-                    .collect();
-                let target = placement.place(&hash_key, request_text, &healthy);
-                let idx = healthy_indices
-                    .iter()
-                    .copied()
-                    .find(|&idx| workers[idx].url() == target)?;
-                debug!(
-                    "Session placement: key='{}' -> worker='{}'",
-                    hash_key, target
-                );
-                workers[idx].increment_processed();
-                RouterMetrics::record_processed_request(&target);
-                RouterMetrics::record_policy_decision(self.name(), &target);
-                return Some(idx);
-            }
-        }
-
         // Find target worker using consistent hashing
-        let target_worker_url = match self.find_worker_by_hash(&hash_key) {
+        let target_worker_url = match self.find_worker_by_hash(hash_key) {
             Some(url) => {
                 info!(
                     "CONSISTENT_HASH_DEBUG: Hash key '{}' mapped to worker: {}",
@@ -489,11 +444,101 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
             }
         }
     }
+}
+
+impl LoadBalancingPolicy for ConsistentHashPolicy {
+    fn select_worker_with_headers(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        let healthy_indices = get_healthy_worker_indices(workers);
+
+        if healthy_indices.is_empty() {
+            return None;
+        }
+
+        // Update hash ring if needed
+        self.update_hash_ring(workers);
+
+        // Extract hash key with priority: headers > body > fallback
+        let hash_key = hash_key::extract_hash_key(request_text, headers);
+
+        // DEBUG: Log the request text and extracted hash key
+        if let Some(text) = request_text {
+            debug!("CONSISTENT_HASH_DEBUG: Request text length: {}", text.len());
+        }
+        if let Some(hdrs) = headers {
+            debug!(
+                "CONSISTENT_HASH_DEBUG: Headers available: {:?}",
+                hdrs.keys().collect::<Vec<_>>()
+            );
+        }
+        info!("CONSISTENT_HASH_DEBUG: Extracted hash key: {}", hash_key);
+
+        // Session keys go to their sticky worker. A new session goes to the healthy
+        // worker holding the fewest context tokens once least-tokens placement is
+        // on, otherwise to its hash-ring worker (recorded). Keyless requests hash.
+        if !hash_key.starts_with("request") {
+            let healthy: Vec<&str> = healthy_indices
+                .iter()
+                .map(|&idx| workers[idx].url())
+                .collect();
+            let mut hashed = None;
+            let (target, by_tokens) =
+                self.placement
+                    .route(&hash_key, request_text, &healthy, || {
+                        let idx = self.hash_select(workers, &healthy_indices, &hash_key)?;
+                        hashed = Some(idx);
+                        Some(workers[idx].url().to_string())
+                    })?;
+            if !by_tokens {
+                return hashed;
+            }
+            let idx = healthy_indices
+                .iter()
+                .copied()
+                .find(|&idx| workers[idx].url() == target)?;
+            debug!(
+                "Session placement: key='{}' -> worker='{}'",
+                hash_key, target
+            );
+            workers[idx].increment_processed();
+            RouterMetrics::record_processed_request(&target);
+            RouterMetrics::record_policy_decision(self.name(), &target);
+            return Some(idx);
+        }
+        self.hash_select(workers, &healthy_indices, &hash_key)
+    }
 
     fn release_session_owners(&self) -> usize {
-        self.placement
-            .as_ref()
-            .map_or(0, |placement| placement.release_owners())
+        self.placement.release_owners()
+    }
+
+    fn set_session_placement(&self, placement: &str) -> Result<(&'static str, usize), String> {
+        match placement {
+            "least_tokens" => {
+                let (was_least_tokens, tracked) = self.placement.enable_least_tokens();
+                Ok((
+                    if was_least_tokens {
+                        "least_tokens"
+                    } else {
+                        "hash"
+                    },
+                    tracked,
+                ))
+            }
+            "hash" if !self.placement.is_least_tokens() => {
+                Ok(("hash", self.placement.session_counts().0))
+            }
+            "hash" => Err(
+                "least_tokens placement cannot return to hash: placed sessions would move".into(),
+            ),
+            other => Err(format!(
+                "placement must be 'hash' or 'least_tokens', got {other:?}"
+            )),
+        }
     }
 
     fn select_worker_with_lease(
@@ -523,32 +568,41 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
             return Some((idx, Some(SessionLease::Stateless(worker))));
         }
         let hash_key = hash_key::extract_hash_key(request_text, headers);
-        if let Some(placement) = &self.placement {
-            if !hash_key.starts_with("request") {
-                let healthy_indices = get_healthy_worker_indices(workers);
-                if healthy_indices.is_empty() {
-                    return None;
-                }
-                let healthy: Vec<&str> = healthy_indices
-                    .iter()
-                    .map(|&idx| workers[idx].url())
-                    .collect();
-                let (target, lease) = placement.place_and_lease(&hash_key, request_text, &healthy);
-                let idx = healthy_indices
-                    .into_iter()
-                    .find(|&idx| workers[idx].url() == target)?;
-                workers[idx].increment_processed();
-                RouterMetrics::record_processed_request(&target);
-                RouterMetrics::record_policy_decision(self.name(), &target);
-                return Some((idx, Some(lease)));
+        if !hash_key.starts_with("request") {
+            let healthy_indices = get_healthy_worker_indices(workers);
+            if healthy_indices.is_empty() {
+                return None;
             }
+            self.update_hash_ring(workers);
+            let healthy: Vec<&str> = healthy_indices
+                .iter()
+                .map(|&idx| workers[idx].url())
+                .collect();
+            let mut hashed = None;
+            let (target, by_tokens, lease) =
+                self.placement
+                    .route_and_lease(&hash_key, request_text, &healthy, || {
+                        let idx = self.hash_select(workers, &healthy_indices, &hash_key)?;
+                        hashed = Some(idx);
+                        Some(workers[idx].url().to_string())
+                    })?;
+            if !by_tokens {
+                return hashed.map(|idx| (idx, Some(lease)));
+            }
+            let idx = healthy_indices
+                .into_iter()
+                .find(|&idx| workers[idx].url() == target)?;
+            workers[idx].increment_processed();
+            RouterMetrics::record_processed_request(&target);
+            RouterMetrics::record_policy_decision(self.name(), &target);
+            return Some((idx, Some(lease)));
         }
         self.select_worker_with_headers(workers, request_text, headers)
             .map(|idx| (idx, None))
     }
 
     fn session_placement(&self) -> &'static str {
-        if self.placement.is_some() {
+        if self.placement.is_least_tokens() {
             "least_tokens"
         } else {
             "hash"
@@ -614,6 +668,7 @@ mod tests {
     use super::*;
     use crate::core::BasicWorker;
     use crate::core::WorkerType;
+    use std::collections::HashMap;
 
     #[test]
     fn leased_hash_selection_matches_existing_hash_without_reservations() {
@@ -637,7 +692,10 @@ mod tests {
                 .select_worker_with_lease(&workers, Some("body"), Some(&headers))
                 .unwrap();
             assert_eq!(selected, leased);
-            assert!(lease.is_none());
+            // Hash mode tracks the session for a later placement change but
+            // reserves no worker load.
+            assert!(matches!(lease, Some(SessionLease::Session { .. })));
+            assert_eq!(workers[leased].load(), 0);
         }
         assert_eq!(policy.release_session_owners(), 0);
         assert_eq!(policy.session_placement(), "hash");
@@ -785,5 +843,160 @@ mod tests {
             *by_tokens.iter().min().unwrap() >= mean / 2,
             "{by_tokens:?}"
         );
+    }
+
+    fn token_body(tokens: usize) -> String {
+        let ids: Vec<String> = (0..tokens).map(|i| (i % 1000).to_string()).collect();
+        format!("{{\"prompt_ids\":[{}]}}", ids.join(","))
+    }
+
+    fn session(key: &str) -> RequestHeaders {
+        [("x-session-id".to_string(), key.to_string())]
+            .into_iter()
+            .collect()
+    }
+
+    fn eight_workers() -> Vec<Arc<dyn Worker>> {
+        (0..8)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://worker-{i}"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    /// Hash placement is switched to least tokens at runtime: sessions seen
+    /// before keep their hash worker (with leases still in flight), and new
+    /// sessions go to the worker with the fewest tracked context tokens.
+    #[test]
+    fn hot_least_tokens_keeps_existing_sessions_and_spreads_new_ones() {
+        let policy = ConsistentHashPolicy::with_placement(None);
+        let workers = eight_workers();
+        let mut owners = HashMap::new();
+        let mut held = Vec::new();
+        for i in 0..40 {
+            let key = format!("old-{i}");
+            let body = token_body(1000 + 50 * i);
+            let headers = session(&key);
+            let (idx, lease) = policy
+                .select_worker_with_lease(&workers, Some(&body), Some(&headers))
+                .unwrap();
+            // Hash mode routes exactly as the ring does.
+            let ring_key = hash_key::extract_hash_key(Some(&body), Some(&headers));
+            assert_eq!(
+                Some(workers[idx].url().to_string()),
+                policy.find_worker_by_hash(&ring_key)
+            );
+            owners.insert(key, workers[idx].url().to_string());
+            if i % 2 == 0 {
+                held.push(lease); // still generating across the switch
+            }
+        }
+        assert_eq!(policy.session_placement(), "hash");
+        assert_eq!(
+            policy.set_session_placement("least_tokens"),
+            Ok(("hash", 40))
+        );
+        assert_eq!(policy.session_placement(), "least_tokens");
+        assert_eq!(
+            policy.set_session_placement("least_tokens"),
+            Ok(("least_tokens", 40))
+        );
+        assert!(policy.set_session_placement("hash").is_err());
+
+        for i in 0..24 {
+            let key = format!("new-{i}");
+            let loads = policy.placement.worker_tokens();
+            let least = workers
+                .iter()
+                .map(|worker| worker.url().to_string())
+                .min_by_key(|url| (loads.get(url).copied().unwrap_or(0), url.clone()))
+                .unwrap();
+            let least_load = loads.get(&least).copied().unwrap_or(0);
+            let (idx, lease) = policy
+                .select_worker_with_lease(&workers, Some(&token_body(500)), Some(&session(&key)))
+                .unwrap();
+            assert_eq!(
+                loads.get(workers[idx].url()).copied().unwrap_or(0),
+                least_load,
+                "{key} went to a worker heavier than the lightest"
+            );
+            drop(lease);
+        }
+        for (key, owner) in &owners {
+            let (idx, lease) = policy
+                .select_worker_with_lease(&workers, Some(&token_body(3000)), Some(&session(key)))
+                .unwrap();
+            assert_eq!(workers[idx].url(), owner, "{key} moved after the switch");
+            drop(lease);
+        }
+        drop(held);
+        assert_eq!(policy.placement.session_counts(), (64, 0));
+    }
+
+    /// Concurrent selects across a runtime switch lose and duplicate no lease,
+    /// keep every session on one worker, and leave no request in flight.
+    #[test]
+    fn concurrent_selects_across_the_switch_keep_owners_and_balance_leases() {
+        let policy = Arc::new(ConsistentHashPolicy::with_placement(None));
+        let workers = Arc::new(eight_workers());
+        let routed: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let (policy, workers, routed, leases) = (
+                    Arc::clone(&policy),
+                    Arc::clone(&workers),
+                    Arc::clone(&routed),
+                    Arc::clone(&leases),
+                );
+                scope.spawn(move || {
+                    let mut held = Vec::new();
+                    for round in 0..150 {
+                        // Shared sessions are reused by every thread; private ones are new.
+                        let key = if round % 3 == 0 {
+                            format!("shared-{}", round % 30)
+                        } else {
+                            format!("t{thread}-{}", round / 3)
+                        };
+                        let (idx, lease) = policy
+                            .select_worker_with_lease(
+                                &workers,
+                                Some(&token_body(100 + round)),
+                                Some(&session(&key)),
+                            )
+                            .unwrap();
+                        assert!(lease.is_some());
+                        leases.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        routed
+                            .lock()
+                            .unwrap()
+                            .push((key, workers[idx].url().to_string()));
+                        held.push(lease);
+                        if held.len() > 4 {
+                            held.remove(0);
+                        }
+                    }
+                });
+            }
+            let switcher = Arc::clone(&policy);
+            scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                switcher.set_session_placement("least_tokens").unwrap();
+            });
+        });
+        assert_eq!(policy.session_placement(), "least_tokens");
+        assert_eq!(leases.load(std::sync::atomic::Ordering::SeqCst), 8 * 150);
+        // Every lease settled exactly once: nothing is left in flight.
+        let (sessions, inflight) = policy.placement.session_counts();
+        assert_eq!(inflight, 0);
+        let mut owner: HashMap<String, String> = HashMap::new();
+        for (key, worker) in routed.lock().unwrap().iter() {
+            let first = owner.entry(key.clone()).or_insert_with(|| worker.clone());
+            assert_eq!(first, worker, "session {key} changed worker");
+        }
+        assert_eq!(sessions, owner.len());
     }
 }

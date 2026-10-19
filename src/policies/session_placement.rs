@@ -1,9 +1,17 @@
 //! Token-aware placement of new sessions for the consistent hash policy.
 //!
-//! Opt-in with `VLLM_ROUTER_SESSION_PLACEMENT=least_tokens`. A session key seen
-//! for the first time is placed on the healthy worker whose sessions hold the
-//! fewest context tokens, instead of the worker the hash ring names. Later
+//! Opt-in with `VLLM_ROUTER_SESSION_PLACEMENT=least_tokens` at startup, or later
+//! with `POST /session_placement {"placement": "least_tokens"}`. A session key
+//! seen for the first time is placed on the healthy worker whose sessions hold
+//! the fewest context tokens, instead of the worker the hash ring names. Later
 //! requests of that session stay on the same worker for prefix-cache reuse.
+//!
+//! In hash mode every session request still goes to the hash ring's worker, but
+//! the session, its worker, its context length and its in-flight leases are
+//! recorded. Enabling least-tokens placement at runtime therefore changes only
+//! where sessions first seen afterwards go: every tracked session keeps its
+//! worker, outstanding leases still settle against it, and the recorded loads
+//! steer new sessions away from the hot workers.
 //! Every request updates its session's context length. A routed request holds a
 //! [`SessionLease`] until it settles (response fully sent, failed or dropped);
 //! a session with a request in flight never expires, so a long generation keeps
@@ -29,6 +37,8 @@ use std::time::{Duration, Instant};
 pub const PLACEMENT_ENV: &str = "VLLM_ROUTER_SESSION_PLACEMENT";
 pub const IDLE_SECS_ENV: &str = "VLLM_ROUTER_SESSION_IDLE_SECS";
 const DEFAULT_IDLE_SECS: u64 = 900;
+/// Session idle time before it stops counting toward its worker's load.
+pub const DEFAULT_IDLE: Duration = Duration::from_secs(DEFAULT_IDLE_SECS);
 const RETAIN_IDLE_PERIODS: u32 = 4;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -56,6 +66,8 @@ struct State {
     sessions: HashMap<String, Session>,
     loads: HashMap<String, Load>,
     last_sweep: Instant,
+    /// New sessions go to the least-tokens worker; otherwise to the hash ring's.
+    least_tokens: bool,
 }
 
 impl State {
@@ -109,35 +121,162 @@ pub struct TokenPlacement {
 }
 
 impl TokenPlacement {
+    /// Least-tokens placement of new sessions.
     pub fn new(idle: Duration) -> Self {
+        Self::with_mode(idle, true)
+    }
+
+    /// Hash placement that records sessions so least-tokens can be enabled later.
+    pub fn tracking(idle: Duration) -> Self {
+        Self::with_mode(idle, false)
+    }
+
+    fn with_mode(idle: Duration, least_tokens: bool) -> Self {
         Self {
             idle,
             state: Mutex::new(State {
                 sessions: HashMap::new(),
                 loads: HashMap::new(),
                 last_sweep: Instant::now(),
+                least_tokens,
             }),
         }
     }
 
-    /// Build from the environment; `None` keeps plain consistent hashing.
-    pub fn from_env() -> Option<Self> {
+    /// Build from the environment: hash (the default) tracks sessions only.
+    pub fn from_env() -> Self {
+        let idle = match std::env::var(IDLE_SECS_ENV).ok().as_deref() {
+            None | Some("") => DEFAULT_IDLE_SECS,
+            Some(value) => match value.parse::<u64>() {
+                Ok(secs) if secs > 0 => secs,
+                _ => panic!("{IDLE_SECS_ENV} must be a positive integer, got {value:?}"),
+            },
+        };
         match std::env::var(PLACEMENT_ENV).ok().as_deref() {
-            None | Some("") | Some("hash") => None,
-            Some("least_tokens") => {
-                let idle = match std::env::var(IDLE_SECS_ENV).ok().as_deref() {
-                    None | Some("") => DEFAULT_IDLE_SECS,
-                    Some(value) => match value.parse::<u64>() {
-                        Ok(secs) if secs > 0 => secs,
-                        _ => panic!("{IDLE_SECS_ENV} must be a positive integer, got {value:?}"),
-                    },
-                };
-                Some(Self::new(Duration::from_secs(idle)))
-            }
+            None | Some("") | Some("hash") => Self::tracking(Duration::from_secs(idle)),
+            Some("least_tokens") => Self::new(Duration::from_secs(idle)),
             Some(other) => {
                 panic!("{PLACEMENT_ENV} must be 'hash' or 'least_tokens', got {other:?}")
             }
         }
+    }
+
+    /// Whether sessions first seen now are placed by least tokens.
+    pub fn is_least_tokens(&self) -> bool {
+        self.state.lock().unwrap().least_tokens
+    }
+
+    /// Place sessions first seen from now on by least tokens. Every tracked
+    /// session keeps its worker and in-flight leases. Returns whether least-tokens
+    /// placement was already on, and the number of tracked sessions.
+    pub fn enable_least_tokens(&self) -> (bool, usize) {
+        let mut state = self.state.lock().unwrap();
+        let previous = state.least_tokens;
+        state.least_tokens = true;
+        (previous, state.sessions.len())
+    }
+
+    /// Route session `key` without reserving it: by least tokens once enabled,
+    /// otherwise to `hash_route`'s worker, recorded. Returns the worker and
+    /// whether least-tokens placement chose it.
+    pub fn route(
+        &self,
+        key: &str,
+        request_text: Option<&str>,
+        healthy: &[&str],
+        hash_route: impl FnOnce() -> Option<String>,
+    ) -> Option<(String, bool)> {
+        let mut state = self.state.lock().unwrap();
+        self.route_locked(
+            &mut state,
+            key,
+            request_text,
+            healthy,
+            hash_route,
+            Instant::now(),
+        )
+    }
+
+    /// [`Self::route`] and reserve the session in one transaction, so a mode
+    /// change or reset cannot move the owner between selection and reservation.
+    pub fn route_and_lease(
+        self: &Arc<Self>,
+        key: &str,
+        request_text: Option<&str>,
+        healthy: &[&str],
+        hash_route: impl FnOnce() -> Option<String>,
+    ) -> Option<(String, bool, SessionLease)> {
+        let mut state = self.state.lock().unwrap();
+        let (worker, by_tokens) = self.route_locked(
+            &mut state,
+            key,
+            request_text,
+            healthy,
+            hash_route,
+            Instant::now(),
+        )?;
+        state.sessions.get_mut(key).unwrap().inflight += 1;
+        let lease = SessionLease::Session {
+            placement: Arc::clone(self),
+            key: key.to_string(),
+        };
+        Some((worker, by_tokens, lease))
+    }
+
+    fn route_locked(
+        &self,
+        state: &mut State,
+        key: &str,
+        request_text: Option<&str>,
+        healthy: &[&str],
+        hash_route: impl FnOnce() -> Option<String>,
+        now: Instant,
+    ) -> Option<(String, bool)> {
+        if state.least_tokens {
+            return Some((
+                self.place_locked(state, key, request_text, healthy, now),
+                true,
+            ));
+        }
+        let worker = hash_route()?;
+        self.sweep(state, now);
+        state.set_counted(key, false);
+        let exact = prompt_token_count(request_text);
+        let estimate = request_text.map_or(0, |text| text.len() as u64 / 4);
+        let session = state.sessions.entry(key.to_string()).or_insert(Session {
+            worker: String::new(),
+            tokens: 0,
+            last_seen: now,
+            counted: false,
+            inflight: 0,
+            released: false,
+        });
+        session.worker = worker.clone();
+        session.released = false;
+        session.tokens = exact.unwrap_or(session.tokens.max(estimate));
+        session.last_seen = now;
+        state.set_counted(key, true);
+        Some((worker, false))
+    }
+
+    /// Tracked sessions and their in-flight requests, for diagnostics and tests.
+    pub fn session_counts(&self) -> (usize, u64) {
+        let state = self.state.lock().unwrap();
+        let inflight = state
+            .sessions
+            .values()
+            .map(|session| session.inflight as u64)
+            .sum();
+        (state.sessions.len(), inflight)
+    }
+
+    /// The worker that owns session `key`, if it is tracked.
+    pub fn owner(&self, key: &str) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        state
+            .sessions
+            .get(key)
+            .map(|session| session.worker.clone())
     }
 
     /// Return the worker for session `key`. A new session, or one whose worker
@@ -230,6 +369,9 @@ impl TokenPlacement {
     /// Returns the number of sessions released.
     pub fn release_owners(&self) -> usize {
         let mut state = self.state.lock().unwrap();
+        if !state.least_tokens {
+            return 0; // hash placement keeps no stickiness to release
+        }
         for session in state.sessions.values_mut() {
             session.released = true;
         }

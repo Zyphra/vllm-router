@@ -521,6 +521,22 @@ async fn session_placement(
     state.router.session_placement()
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct SessionPlacementChange {
+    placement: String,
+}
+
+async fn set_session_placement(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(change): Json<SessionPlacementChange>,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    state.router.set_session_placement(&change.placement)
+}
+
 async fn reset_session_placement(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -779,7 +795,10 @@ pub fn build_app_with_request_tracing(
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
         .route("/reset_session_placement", post(reset_session_placement))
-        .route("/session_placement", get(session_placement))
+        .route(
+            "/session_placement",
+            get(session_placement).post(set_session_placement),
+        )
         .route("/get_loads", get(get_loads));
 
     // Worker management routes
