@@ -291,6 +291,11 @@ fails or is dropped, so concurrent native generation and abort requests retain
 the same owner across a reset. `POST /reset_session_placement` marks owners for
 re-placement on their next idle request; an in-flight request keeps its owner.
 
+Transparent forwarding releases the incoming body bytes and parsed JSON after
+selection and request serialization, before waiting for the backend response.
+This keeps prompt arrays out of the generation wait while preserving request
+IDs in transport errors and the response lease through completion or drop.
+
 `GET /session_placement` reports `atomic_select_and_lease: true` and the effective
 `placement` (`hash` or `least_tokens`). The reset response includes the same
 metadata and `released_sessions`. Both endpoints use the router's request
