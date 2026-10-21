@@ -156,6 +156,19 @@ impl PolicyRegistry {
         released
     }
 
+    /// Apply a session placement change to the default and every model policy.
+    /// Returns the default policy's previous placement and the tracked sessions.
+    pub fn set_session_placement(&self, placement: &str) -> Result<(&'static str, usize), String> {
+        let default = self.get_default_policy();
+        let (previous, mut tracked) = default.set_session_placement(placement)?;
+        for policy in self.model_policies.read().unwrap().values() {
+            if !Arc::ptr_eq(policy, &default) {
+                tracked += policy.set_session_placement(placement)?.1;
+            }
+        }
+        Ok((previous, tracked))
+    }
+
     pub fn get_default_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
         Arc::clone(&self.default_policy)
     }

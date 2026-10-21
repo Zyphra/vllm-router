@@ -162,6 +162,16 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
             .into_response()
     }
 
+    /// Switch session placement for sessions first seen from now on.
+    fn set_session_placement(&self, placement: &str) -> Response {
+        let _ = placement;
+        (
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "session placement changes are not supported by this router",
+        )
+            .into_response()
+    }
+
     /// Session placement capabilities of this router.
     fn session_placement(&self) -> Response {
         (

@@ -123,6 +123,17 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         0 // Default: the policy keeps no session ownership
     }
 
+    /// Switch session placement for sessions first seen from now on; tracked
+    /// sessions keep their worker and leases. Returns the previous placement and
+    /// the number of tracked sessions.
+    fn set_session_placement(&self, placement: &str) -> Result<(&'static str, usize), String> {
+        let _ = placement;
+        Err(format!(
+            "{} does not support session placement changes",
+            self.name()
+        ))
+    }
+
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 

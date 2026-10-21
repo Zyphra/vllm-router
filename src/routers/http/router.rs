@@ -1646,6 +1646,25 @@ impl RouterTrait for Router {
         .into_response()
     }
 
+    fn set_session_placement(&self, placement: &str) -> Response {
+        match self.policy_registry.set_session_placement(placement) {
+            Ok((previous, tracked)) => {
+                info!(
+                    "Session placement {} -> {} for new sessions; {} tracked sessions keep their worker",
+                    previous, placement, tracked
+                );
+                Json(serde_json::json!({
+                    "atomic_select_and_lease": true,
+                    "placement": self.policy_registry.get_default_policy().session_placement(),
+                    "previous": previous,
+                    "tracked_sessions": tracked,
+                }))
+                .into_response()
+            }
+            Err(message) => (axum::http::StatusCode::CONFLICT, message).into_response(),
+        }
+    }
+
     async fn get_worker_loads(&self) -> Response {
         let urls = self.get_worker_urls();
         let mut loads = Vec::new();
@@ -2823,6 +2842,73 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        for (_, _, task) in backends {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn placement_can_switch_from_hash_to_least_tokens_at_runtime() {
+        use crate::server::{build_app_with_request_tracing, AppContext, AppState};
+        use tower::ServiceExt;
+        let (router, backends) = stateless_fixture().await;
+        let config = crate::config::RouterConfig::default();
+        let context = Arc::new(AppContext::new(config, Client::new(), 10, None, vec![]).unwrap());
+        let app = build_app_with_request_tracing(
+            Arc::new(AppState {
+                router: router.clone(),
+                context,
+                concurrency_queue_tx: None,
+                router_manager: None,
+            }),
+            1024 * 1024,
+            vec![],
+            vec![],
+            true,
+            false,
+        );
+        let call = |method: Method, body: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::builder().method(method).uri("/session_placement");
+                if body.is_some() {
+                    request = request.header("content-type", "application/json");
+                }
+                let response = app
+                    .oneshot(
+                        request
+                            .body(body.map_or(Body::empty(), Body::from))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                (status, response_text(response).await)
+            }
+        };
+        let (status, text) = call(Method::GET, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["placement"],
+            "hash"
+        );
+        let (status, text) = call(Method::POST, Some(r#"{"placement":"least_tokens"}"#)).await;
+        assert_eq!(status, StatusCode::OK);
+        let changed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(changed["placement"], "least_tokens");
+        assert_eq!(changed["previous"], "hash");
+        assert_eq!(changed["atomic_select_and_lease"], true);
+        let (_, text) = call(Method::GET, None).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["placement"],
+            "least_tokens"
+        );
+        for refused in [r#"{"placement":"hash"}"#, r#"{"placement":"random"}"#] {
+            assert_eq!(
+                call(Method::POST, Some(refused)).await.0,
+                StatusCode::CONFLICT
+            );
         }
         for (_, _, task) in backends {
             task.abort();
