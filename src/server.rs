@@ -100,6 +100,14 @@ async fn sink_handler() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
 
+// Drain ready accepts without the request tasks' I/O budget. Axum spawns each
+// connection separately, so its HTTP work retains the normal Tokio budget.
+pub(crate) fn unconstrained_accept<F: std::future::IntoFuture>(
+    server: F,
+) -> tokio::task::Unconstrained<F::IntoFuture> {
+    tokio::task::unconstrained(server.into_future())
+}
+
 /// Transparent proxy handler for unmatched routes
 /// Routes requests through the router's route_transparent method
 async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -1066,8 +1074,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let addr = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(&addr).await?;
     info!("Starting server on {}", addr);
-    serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+    unconstrained_accept(serve(listener, app).with_graceful_shutdown(shutdown_signal()))
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 

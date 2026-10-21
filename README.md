@@ -296,6 +296,12 @@ one transaction. This shortens the serialized section without changing token
 counts or affinity. It does not by itself establish cold-burst acceptance or a
 production latency improvement.
 
+The HTTP accept future drains ready connections without Tokio's cooperative I/O
+budget. Awaiting listener readiness still yields, and graceful shutdown waits for
+active responses. Axum's separately spawned HTTP tasks retain their normal
+cooperative budgets. This scheduling rule does not raise the socket backlog or
+establish a production cold-burst latency result.
+
 Transparent forwarding releases the incoming body bytes and parsed JSON after
 selection and request serialization, before waiting for the backend response.
 This keeps prompt arrays out of the generation wait while preserving request
