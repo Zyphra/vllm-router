@@ -290,6 +290,11 @@ transaction. The lease holds ownership until the forwarded response completes,
 fails or is dropped, so concurrent native generation and abort requests retain
 the same owner across a reset. `POST /reset_session_placement` marks owners for
 re-placement on their next idle request; an in-flight request keeps its owner.
+Prompt-token counting and the byte estimate run before taking the placement
+mutex; owner selection, load updates, expiry sweep and lease acquisition remain
+one transaction. This shortens the serialized section without changing token
+counts or affinity. It does not by itself establish cold-burst acceptance or a
+production latency improvement.
 
 Transparent forwarding releases the incoming body bytes and parsed JSON after
 selection and request serialization, before waiting for the backend response.

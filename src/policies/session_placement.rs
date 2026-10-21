@@ -156,8 +156,10 @@ impl TokenPlacement {
         healthy: &[&str],
         now: Instant,
     ) -> String {
+        let tokens = prompt_token_count(request_text);
+        let estimate = request_text.map_or(0, |text| text.len() as u64 / 4);
         let mut state = self.state.lock().unwrap();
-        self.place_locked(&mut state, key, request_text, healthy, now)
+        self.place_locked(&mut state, key, (tokens, estimate), healthy, now)
     }
 
     /// Select and reserve the owner in one transaction. Hold the returned lease
@@ -169,8 +171,12 @@ impl TokenPlacement {
         healthy: &[&str],
     ) -> (String, SessionLease) {
         let now = Instant::now();
+        // Request-only scanning must not serialize every placement and lease
+        // behind a long prompt while occupying the async runtime's workers.
+        let tokens = prompt_token_count(request_text);
+        let estimate = request_text.map_or(0, |text| text.len() as u64 / 4);
         let mut state = self.state.lock().unwrap();
-        let worker = self.place_locked(&mut state, key, request_text, healthy, now);
+        let worker = self.place_locked(&mut state, key, (tokens, estimate), healthy, now);
         state.sessions.get_mut(key).unwrap().inflight += 1;
         let lease = SessionLease::Session {
             placement: Arc::clone(self),
@@ -183,12 +189,11 @@ impl TokenPlacement {
         &self,
         state: &mut State,
         key: &str,
-        request_text: Option<&str>,
+        context: (Option<u64>, u64),
         healthy: &[&str],
         now: Instant,
     ) -> String {
-        let exact = prompt_token_count(request_text);
-        let estimate = request_text.map_or(0, |text| text.len() as u64 / 4);
+        let (exact, estimate) = context;
         self.sweep(state, now);
 
         let owner_gone = state.sessions.get(key).is_some_and(|session| {
@@ -341,6 +346,11 @@ mod tests {
     #[test]
     fn counts_prompt_ids() {
         assert_eq!(prompt_token_count(Some(&body(3))), Some(3));
+        assert_eq!(prompt_token_count(Some(&body(103_000))), Some(103_000));
+        assert_eq!(prompt_token_count(Some("null")), None);
+        assert_eq!(prompt_token_count(Some("[7,8]")), None);
+        assert_eq!(prompt_token_count(Some("{}")), None);
+        assert_eq!(prompt_token_count(Some("{\"prompt_ids\":null}")), None);
         assert_eq!(prompt_token_count(Some("{\"prompt_ids\": [ ]}")), Some(0));
         assert_eq!(
             prompt_token_count(Some("{\"prompt_ids\" : [7, 8]}")),
