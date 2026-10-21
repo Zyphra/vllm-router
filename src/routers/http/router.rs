@@ -1871,6 +1871,180 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn ready_tcp_accepts_are_not_cut_off_by_the_cooperative_budget() {
+        use std::future::{poll_fn, Future, IntoFuture};
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+
+        struct CountingListener {
+            inner: tokio::net::TcpListener,
+            accepted: Arc<AtomicUsize>,
+        }
+        impl axum::serve::Listener for CountingListener {
+            type Io = tokio::net::TcpStream;
+            type Addr = std::net::SocketAddr;
+
+            async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+                let connection = self.inner.accept().await.unwrap();
+                self.accepted.fetch_add(1, Ordering::SeqCst);
+                connection
+            }
+
+            fn local_addr(&self) -> std::io::Result<Self::Addr> {
+                self.inner.local_addr()
+            }
+        }
+
+        async fn first_poll(unconstrained: bool) -> usize {
+            const CONNECTIONS: usize = 257;
+            let inner = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = inner.local_addr().unwrap();
+            // Establish real TCP connections before polling the accept future.
+            // This keeps network arrival timing out of the budget comparison.
+            let clients: Vec<_> = (0..CONNECTIONS)
+                .map(|_| {
+                    std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1)).unwrap()
+                })
+                .collect();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let listener = CountingListener {
+                inner,
+                accepted: accepted.clone(),
+            };
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let server = axum::serve(listener, axum::Router::new()).with_graceful_shutdown(async {
+                let _ = stopped.await;
+            });
+            let mut future: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> =
+                if unconstrained {
+                    Box::pin(crate::server::unconstrained_accept(server))
+                } else {
+                    Box::pin(server.into_future())
+                };
+            tokio::task::yield_now().await;
+            let progress = poll_fn(|context| {
+                assert!(future.as_mut().poll(context).is_pending());
+                Poll::Ready(accepted.load(Ordering::SeqCst))
+            })
+            .await;
+            drop(clients);
+            stop.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), future)
+                .await
+                .unwrap()
+                .unwrap();
+            progress
+        }
+
+        let stock = first_poll(false).await;
+        let changed = first_poll(true).await;
+        println!("ready-accept first poll: stock={stock}, changed={changed}, queued=257");
+        assert!(
+            stock > 0 && stock < 257,
+            "stock first-poll accepts: {stock}"
+        );
+        assert_eq!(changed, 257);
+    }
+
+    #[tokio::test]
+    async fn accept_progress_preserves_http_budget_held_requests_and_shutdown() {
+        use std::future::{poll_fn, Future};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+
+        let received = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let app = axum::Router::new()
+            .route(
+                "/held",
+                axum::routing::get({
+                    let received = received.clone();
+                    let release = release.clone();
+                    move || {
+                        let received = received.clone();
+                        let release = release.clone();
+                        async move {
+                            received.notify_one();
+                            release.notified().await;
+                            "held-response"
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/budget",
+                axum::routing::get(|| async {
+                    let progress = Arc::new(AtomicUsize::new(0));
+                    let observed = progress.clone();
+                    let work = async move {
+                        for _ in 0..257 {
+                            tokio::task::consume_budget().await;
+                            observed.fetch_add(1, Ordering::SeqCst);
+                        }
+                    };
+                    tokio::pin!(work);
+                    let first = poll_fn(|context| {
+                        assert!(
+                            work.as_mut().poll(context).is_pending(),
+                            "spawned HTTP work lost its cooperative budget"
+                        );
+                        Poll::Ready(progress.load(Ordering::SeqCst))
+                    })
+                    .await;
+                    work.await;
+                    Json(serde_json::json!({"first_poll": first, "completed": 257}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(crate::server::unconstrained_accept(
+            axum::serve(listener, app).with_graceful_shutdown(async {
+                let _ = stopped.await;
+            }),
+        ));
+        let client = Client::builder().no_proxy().build().unwrap();
+        let held = tokio::spawn(client.get(format!("http://{address}/held")).send());
+        tokio::time::timeout(Duration::from_secs(5), received.notified())
+            .await
+            .unwrap();
+        assert!(!held.is_finished());
+        // A fresh connection must make progress while the first response is held.
+        let budget: serde_json::Value = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get(format!("http://{address}/budget")).send(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert!(budget["first_poll"].as_u64().unwrap() < 257);
+        println!("spawned HTTP budget control: {budget}");
+        assert_eq!(budget["completed"], 257);
+        stop.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !server.is_finished(),
+            "graceful shutdown dropped the held request"
+        );
+        release.notify_one();
+        assert_eq!(
+            held.await.unwrap().unwrap().text().await.unwrap(),
+            "held-response"
+        );
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
+
     #[test]
     fn test_router_get_worker_urls_regular() {
         let router = create_test_regular_router();
