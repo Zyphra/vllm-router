@@ -139,6 +139,10 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
         }
     };
 
+    // The parsed request owns its contents; raw token JSON is no longer needed
+    // while the upstream generation is pending.
+    drop(body_bytes);
+
     // Route through transparent proxy
     state
         .router

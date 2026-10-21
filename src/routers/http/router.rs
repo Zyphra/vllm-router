@@ -1770,6 +1770,13 @@ impl RouterTrait for Router {
         if !body.is_null() {
             request_builder = request_builder.json(&body);
         }
+        // Keep only the error context after reqwest serializes the request.
+        // Parsed token arrays otherwise stay alive for the entire generation.
+        let request_id = body
+            .get("request_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
+        drop(body);
 
         // Add authorization if configured
         if let Some(ref key) = self.api_key {
@@ -1819,7 +1826,7 @@ impl RouterTrait for Router {
                     started.elapsed().as_millis(),
                     e.is_timeout(),
                     e.is_connect(),
-                    body.get("request_id").and_then(|value| value.as_str()),
+                    request_id,
                     headers.and_then(|headers| headers.get("x-session-id")).and_then(|value| value.to_str().ok()),
                     worker.dp_rank(),
                 );
@@ -1927,6 +1934,110 @@ mod tests {
             assert!(detail.contains(&url), "{detail}");
             assert!(!detail.contains("prompt-must-not-be-logged"), "{detail}");
         }
+    }
+
+    #[tokio::test]
+    async fn transparent_request_releases_raw_body_before_held_backend_response() {
+        use crate::server::{build_app_with_request_tracing, AppContext, AppState};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tower::ServiceExt;
+
+        struct TrackedBody(Vec<u8>, Arc<AtomicBool>);
+        impl AsRef<[u8]> for TrackedBody {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl Drop for TrackedBody {
+            fn drop(&mut self) {
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let received = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let backend = axum::Router::new().route(
+            "/held_generate",
+            axum::routing::post({
+                let received = received.clone();
+                let release = release.clone();
+                move |Json(body): Json<serde_json::Value>| {
+                    let received = received.clone();
+                    let release = release.clone();
+                    async move {
+                        assert_eq!(body["prompt_ids"].as_array().unwrap().len(), 65536);
+                        assert_eq!(body["prompt_ids"][65535], 17);
+                        assert_eq!(body["request_id"], "held-request");
+                        received.notify_one();
+                        release.notified().await;
+                        Json(serde_json::json!({"request_id": body["request_id"], "ok": true}))
+                    }
+                }
+            }),
+        );
+        let backend = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router
+            .worker_registry
+            .register(Arc::new(BasicWorker::new(url, WorkerType::Regular)));
+        router.client = Client::builder().no_proxy().build().unwrap();
+        let context = Arc::new(
+            AppContext::new(
+                crate::config::RouterConfig::default(),
+                Client::new(),
+                10,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(AppState {
+            router: Arc::new(router),
+            context,
+            concurrency_queue_tx: None,
+            router_manager: None,
+        });
+        let app = build_app_with_request_tracing(state, 1024 * 1024, vec![], vec![], true, false);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "request_id": "held-request", "prompt_ids": vec![17;65536],
+        }))
+        .unwrap();
+        let body = bytes::Bytes::from_owner(TrackedBody(body, dropped.clone()));
+        let pending = tokio::spawn(
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/held_generate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            ),
+        );
+        tokio::time::timeout(Duration::from_secs(5), received.notified())
+            .await
+            .unwrap();
+        assert!(
+            !pending.is_finished(),
+            "backend response must still be held"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "raw body retained across backend wait"
+        );
+        release.notify_one();
+        let response = pending.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let output: serde_json::Value =
+            serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({"request_id": "held-request", "ok": true})
+        );
+        backend.abort();
     }
 
     #[test]
