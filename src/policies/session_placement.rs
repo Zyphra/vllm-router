@@ -347,6 +347,10 @@ mod tests {
     fn counts_prompt_ids() {
         assert_eq!(prompt_token_count(Some(&body(3))), Some(3));
         assert_eq!(prompt_token_count(Some(&body(103_000))), Some(103_000));
+        assert_eq!(prompt_token_count(Some("null")), None);
+        assert_eq!(prompt_token_count(Some("[7,8]")), None);
+        assert_eq!(prompt_token_count(Some("{}")), None);
+        assert_eq!(prompt_token_count(Some("{\"prompt_ids\":null}")), None);
         assert_eq!(prompt_token_count(Some("{\"prompt_ids\": [ ]}")), Some(0));
         assert_eq!(
             prompt_token_count(Some("{\"prompt_ids\" : [7, 8]}")),
