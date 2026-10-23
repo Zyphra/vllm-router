@@ -162,6 +162,14 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
             .into_response()
     }
 
+    fn retire_session(&self, _session_id: &str) -> Response {
+        (
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "session retirement unsupported",
+        )
+            .into_response()
+    }
+
     /// Session placement capabilities of this router.
     fn session_placement(&self) -> Response {
         (

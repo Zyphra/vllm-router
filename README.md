@@ -319,3 +319,10 @@ with explicit zeros for workers without tracked sessions. Other policies return
 null. Snapshot reads expire idle sessions using the configured idle timeout;
 in-flight leases never expire. These logical last-prompt lengths include paused
 sessions, omit decoding since the last prompt, and do not measure unique KV blocks.
+
+`POST /retire_session` with `{"session_id":"<X-Session-ID>"}` retires logical
+session accounting only. Live leases retain their tokens until they settle;
+late requests cannot reopen a retained retired ID. Retirement never aborts work,
+changes a live owner or clears physical KV. The ordinary session retention period
+bounds retired-ID tombstones. Native episode finalization calls this control
+endpoint after request settlement; failed retirement does not invalidate reward.

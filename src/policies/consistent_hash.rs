@@ -533,7 +533,8 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
                     .iter()
                     .map(|&idx| workers[idx].url())
                     .collect();
-                let (target, lease) = placement.place_and_lease(&hash_key, request_text, &healthy);
+                let (target, lease) =
+                    placement.try_place_and_lease(&hash_key, request_text, &healthy)?;
                 let idx = healthy_indices
                     .into_iter()
                     .find(|&idx| workers[idx].url() == target)?;
@@ -545,6 +546,12 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
         }
         self.select_worker_with_headers(workers, request_text, headers)
             .map(|idx| (idx, None))
+    }
+
+    fn retire_session(&self, key: &str) {
+        if let Some(p) = &self.placement {
+            p.retire(&format!("header:x-session-id:{key}"));
+        }
     }
 
     fn session_token_snapshot(&self) -> Option<(u64, std::collections::HashMap<String, u64>)> {

@@ -42,6 +42,7 @@ struct Session {
     inflight: u32,
     /// Set by `release_owners`: re-place on the next request made while idle.
     released: bool,
+    retired: bool,
 }
 
 /// Ordered by tokens first, then by session count as the tie-break.
@@ -170,19 +171,32 @@ impl TokenPlacement {
         request_text: Option<&str>,
         healthy: &[&str],
     ) -> (String, SessionLease) {
+        self.try_place_and_lease(key, request_text, healthy)
+            .expect("session retired")
+    }
+
+    pub fn try_place_and_lease(
+        self: &Arc<Self>,
+        key: &str,
+        request_text: Option<&str>,
+        healthy: &[&str],
+    ) -> Option<(String, SessionLease)> {
         let now = Instant::now();
         // Request-only scanning must not serialize every placement and lease
         // behind a long prompt while occupying the async runtime's workers.
         let tokens = prompt_token_count(request_text);
         let estimate = request_text.map_or(0, |text| text.len() as u64 / 4);
         let mut state = self.state.lock().unwrap();
+        if state.sessions.get(key).is_some_and(|s| s.retired) {
+            return None;
+        }
         let worker = self.place_locked(&mut state, key, (tokens, estimate), healthy, now);
         state.sessions.get_mut(key).unwrap().inflight += 1;
         let lease = SessionLease::Session {
             placement: Arc::clone(self),
             key: key.to_string(),
         };
-        (worker, lease)
+        Some((worker, lease))
     }
 
     fn place_locked(
@@ -216,6 +230,7 @@ impl TokenPlacement {
                 counted: false,
                 inflight: 0,
                 released: false,
+                retired: false,
             });
             session.worker = worker;
             session.released = false;
@@ -259,6 +274,29 @@ impl TokenPlacement {
         if let Some(session) = state.sessions.get_mut(key) {
             session.inflight = session.inflight.saturating_sub(1);
             session.last_seen = now;
+            if session.retired && session.inflight == 0 {
+                state.set_counted(key, false);
+            }
+        }
+    }
+
+    pub fn retire(&self, key: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.sessions.entry(key.to_string()).or_insert(Session {
+            worker: String::new(),
+            tokens: 0,
+            last_seen: Instant::now(),
+            counted: false,
+            inflight: 0,
+            released: true,
+            retired: true,
+        });
+        if let Some(session) = state.sessions.get_mut(key) {
+            session.retired = true;
+            session.released = true;
+            if session.inflight == 0 {
+                state.set_counted(key, false);
+            }
         }
     }
 
@@ -350,6 +388,31 @@ mod tests {
 
     fn tokens_on(placement: &TokenPlacement, worker: &str) -> u64 {
         placement.worker_tokens().get(worker).copied().unwrap_or(0)
+    }
+
+    #[test]
+    fn terminal_retirement_is_idempotent_and_never_moves_or_replaces_leased_work() {
+        let p = Arc::new(TokenPlacement::new(Duration::from_secs(900)));
+        let (worker, live) = p.place_and_lease("live", Some(&body(200)), &["a", "b"]);
+        p.place("tools", Some(&body(100)), &["b"]);
+        p.retire("live");
+        p.retire("live");
+        assert_eq!(p.worker_tokens().get(&worker), Some(&200));
+        assert!(p
+            .try_place_and_lease("live", Some(&body(50)), &["b"])
+            .is_none());
+        drop(live);
+        assert_eq!(p.worker_tokens().get(&worker), Some(&0));
+        assert_eq!(p.worker_tokens().get("b"), Some(&100));
+        assert!(p
+            .try_place_and_lease("live", Some(&body(50)), &["b"])
+            .is_none());
+        p.retire("live");
+        p.retire("queued");
+        assert!(p
+            .try_place_and_lease("queued", Some(&body(50)), &["b"])
+            .is_none());
+        assert_eq!(p.worker_tokens().get("b"), Some(&100));
     }
 
     #[test]

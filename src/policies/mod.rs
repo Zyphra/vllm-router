@@ -121,6 +121,8 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         None
     }
 
+    fn retire_session(&self, _key: &str) {}
+
     /// Forget session ownership because every worker's prefix cache was reset
     /// (a weight update): sessions are re-placed on their next idle request.
     /// Returns the number of sessions released.

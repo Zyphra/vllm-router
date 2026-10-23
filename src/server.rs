@@ -533,6 +533,24 @@ async fn session_placement(
     state.router.session_placement()
 }
 
+async fn retire_session(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    let Some(session_id) = body
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return (StatusCode::BAD_REQUEST, "session_id must be nonempty").into_response();
+    };
+    state.router.retire_session(session_id)
+}
+
 async fn reset_session_placement(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -792,6 +810,7 @@ pub fn build_app_with_request_tracing(
         .route("/flush_cache", post(flush_cache))
         .route("/reset_session_placement", post(reset_session_placement))
         .route("/session_placement", get(session_placement))
+        .route("/retire_session", post(retire_session))
         .route("/get_loads", get(get_loads));
 
     // Worker management routes
