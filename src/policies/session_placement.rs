@@ -253,7 +253,11 @@ impl TokenPlacement {
         for session in state.sessions.values_mut() {
             session.released = true;
         }
-        state.sessions.len()
+        state
+            .sessions
+            .values()
+            .filter(|session| !session.retired)
+            .count()
     }
 
     #[cfg(test)]
