@@ -548,7 +548,9 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
     }
 
     fn session_token_snapshot(&self) -> Option<(u64, std::collections::HashMap<String, u64>)> {
-        self.placement.as_ref().map(|p| (p.idle_seconds(), p.worker_tokens()))
+        self.placement
+            .as_ref()
+            .map(|p| (p.idle_seconds(), p.worker_tokens()))
     }
 
     fn session_placement(&self) -> &'static str {

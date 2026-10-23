@@ -291,7 +291,9 @@ impl TokenPlacement {
         }
     }
 
-    pub fn idle_seconds(&self) -> u64 { self.idle.as_secs() }
+    pub fn idle_seconds(&self) -> u64 {
+        self.idle.as_secs()
+    }
 
     /// Last-prompt tokens, including leased work; expire idle sessions on reads.
     pub fn worker_tokens(&self) -> HashMap<String, u64> {
@@ -361,7 +363,10 @@ mod tests {
         assert_eq!(snapshot.get("a"), Some(&0));
         assert_eq!(snapshot.get("b"), Some(&200));
         settle(&p, live, start + Duration::from_secs(10));
-        assert_eq!(p.worker_tokens_at(start + Duration::from_secs(13)).get("b"), Some(&0));
+        assert_eq!(
+            p.worker_tokens_at(start + Duration::from_secs(13)).get("b"),
+            Some(&0)
+        );
         assert_eq!(p.idle_seconds(), 2);
     }
 
