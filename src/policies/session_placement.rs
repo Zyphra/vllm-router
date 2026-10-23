@@ -285,17 +285,24 @@ impl TokenPlacement {
     }
 
     pub fn retire(&self, key: &str) {
+        self.retire_at(key, Instant::now());
+    }
+
+    fn retire_at(&self, key: &str, now: Instant) {
         let mut state = self.state.lock().unwrap();
         state.sessions.entry(key.to_string()).or_insert(Session {
             worker: String::new(),
             tokens: 0,
-            last_seen: Instant::now(),
+            last_seen: now,
             counted: false,
             inflight: 0,
             released: true,
             retired: true,
         });
         if let Some(session) = state.sessions.get_mut(key) {
+            if !session.retired {
+                session.last_seen = now;
+            }
             session.retired = true;
             session.released = true;
             if session.inflight == 0 {
@@ -417,6 +424,23 @@ mod tests {
             .try_place_and_lease("queued", Some(&body(50)), &["b"])
             .is_none());
         assert_eq!(p.worker_tokens().get("b"), Some(&100));
+    }
+
+    #[test]
+    fn terminal_retention_starts_at_retirement_not_at_last_prompt() {
+        let p = Arc::new(TokenPlacement::new(Duration::from_secs(900)));
+        let start = Instant::now();
+        p.place_at("old", Some(&body(100)), &["a"], start);
+        p.retire_at("old", start + Duration::from_secs(3500));
+        p.worker_tokens_at(start + Duration::from_secs(3610));
+        assert!(p
+            .try_place_and_lease("old", Some(&body(100)), &["a"])
+            .is_none());
+        p.retire_at("old", start + Duration::from_secs(3650));
+        assert_eq!(
+            p.state.lock().unwrap().sessions["old"].last_seen,
+            start + Duration::from_secs(3500)
+        );
     }
 
     #[test]
