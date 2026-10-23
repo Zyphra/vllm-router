@@ -2839,6 +2839,41 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
+        for (body, expected) in [
+            (serde_json::json!({"session_id":"done"}), StatusCode::OK),
+            (
+                serde_json::json!({"session_id":""}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (serde_json::json!({"session_id":7}), StatusCode::BAD_REQUEST),
+            (serde_json::json!({}), StatusCode::BAD_REQUEST),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/retire_session")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let denied = app_for(vec!["http://127.0.0.1:1/auth".to_string()])
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/retire_session")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"session_id\":\"done\"}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
         for (_, _, task) in backends {
             task.abort();
         }
