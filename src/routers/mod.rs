@@ -171,6 +171,15 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
             .into_response()
     }
 
+    /// Update existing session placement from a control-plane KV census.
+    fn update_session_placement(&self, _snapshot: crate::policies::KvSnapshot) -> Response {
+        (
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "KV session placement is not supported by this router",
+        )
+            .into_response()
+    }
+
     /// Get router type name
     fn router_type(&self) -> &'static str;
 

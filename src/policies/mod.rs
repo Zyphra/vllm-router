@@ -12,6 +12,7 @@ mod cache_aware;
 mod consistent_hash;
 mod factory;
 mod hash_key;
+mod kv_capacity;
 mod power_of_two;
 mod random;
 mod registry;
@@ -23,6 +24,7 @@ pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
+pub use kv_capacity::{KvObservation, KvSnapshot};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
@@ -114,6 +116,14 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Effective session placement mode, for capability admission.
     fn session_placement(&self) -> &'static str {
         "hash"
+    }
+
+    fn update_kv_snapshot(
+        &self,
+        _snapshot: KvSnapshot,
+        _registered: &[String],
+    ) -> Result<usize, String> {
+        Err("KV session placement is not supported by this policy".into())
     }
 
     /// Forget session ownership because every worker's prefix cache was reset
