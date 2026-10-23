@@ -312,3 +312,10 @@ IDs in transport errors and the response lease through completion or drop.
 metadata and `released_sessions`. Both endpoints use the router's request
 authorization. Clients enabling token placement can verify these capabilities
 before dispatching requests.
+
+`GET /session_placement` includes a version-1 `token_snapshot` for
+`least_tokens`: registered worker URLs and their tracked prompt-context tokens,
+with explicit zeros for workers without tracked sessions. Other policies return
+null. Snapshot reads expire idle sessions using the configured idle timeout;
+in-flight leases never expire. These logical last-prompt lengths include paused
+sessions, omit decoding since the last prompt, and do not measure unique KV blocks.

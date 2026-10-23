@@ -116,6 +116,9 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         "hash"
     }
 
+    /// A coherent last-prompt snapshot; unsupported policies report None.
+    fn session_token_snapshot(&self) -> Option<(u64, std::collections::HashMap<String, u64>)> { None }
+
     /// Forget session ownership because every worker's prefix cache was reset
     /// (a weight update): sessions are re-placed on their next idle request.
     /// Returns the number of sessions released.

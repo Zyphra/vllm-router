@@ -291,9 +291,16 @@ impl TokenPlacement {
         }
     }
 
-    /// Counted context tokens per worker, for diagnostics and tests.
+    pub fn idle_seconds(&self) -> u64 { self.idle.as_secs() }
+
+    /// Last-prompt tokens, including leased work; expire idle sessions on reads.
     pub fn worker_tokens(&self) -> HashMap<String, u64> {
-        let state = self.state.lock().unwrap();
+        self.worker_tokens_at(Instant::now())
+    }
+
+    fn worker_tokens_at(&self, now: Instant) -> HashMap<String, u64> {
+        let mut state = self.state.lock().unwrap();
+        self.sweep(&mut state, now);
         state
             .loads
             .iter()
@@ -341,6 +348,21 @@ mod tests {
 
     fn tokens_on(placement: &TokenPlacement, worker: &str) -> u64 {
         placement.worker_tokens().get(worker).copied().unwrap_or(0)
+    }
+
+    #[test]
+    fn snapshot_read_expires_idle_but_retains_leased_context() {
+        let p = Arc::new(TokenPlacement::new(Duration::from_secs(2)));
+        let start = Instant::now();
+        p.place_at("idle", Some(&body(100)), &["a"], start);
+        p.place_at("live", Some(&body(200)), &["b"], start);
+        let live = p.lease_at("live", start).unwrap();
+        let snapshot = p.worker_tokens_at(start + Duration::from_secs(10));
+        assert_eq!(snapshot.get("a"), Some(&0));
+        assert_eq!(snapshot.get("b"), Some(&200));
+        settle(&p, live, start + Duration::from_secs(10));
+        assert_eq!(p.worker_tokens_at(start + Duration::from_secs(13)).get("b"), Some(&0));
+        assert_eq!(p.idle_seconds(), 2);
     }
 
     #[test]

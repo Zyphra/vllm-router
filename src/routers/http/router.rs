@@ -1639,8 +1639,16 @@ impl RouterTrait for Router {
     }
 
     fn session_placement(&self) -> Response {
+        let policy = self.policy_registry.get_default_policy();
+        let snapshot = policy.session_token_snapshot().map(|(idle, tokens)| {
+            let workers: Vec<_> = self.get_worker_urls().into_iter().map(|url| {
+                serde_json::json!({"tracked_tokens": tokens.get(&url).copied().unwrap_or(0), "worker_url": url})
+            }).collect();
+            serde_json::json!({"version": 1, "semantics": "last_prompt_idle_expiry", "idle_seconds": idle, "workers": workers})
+        });
         Json(serde_json::json!({
             "atomic_select_and_lease": true,
+            "token_snapshot": snapshot,
             "placement": self.policy_registry.get_default_policy().session_placement(),
         }))
         .into_response()
