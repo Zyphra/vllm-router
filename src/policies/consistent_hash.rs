@@ -629,6 +629,40 @@ mod tests {
     use crate::core::WorkerType;
 
     #[test]
+    fn retirement_joins_the_exact_session_header_key_and_keeps_live_lease() {
+        let policy = ConsistentHashPolicy::with_placement(Some(TokenPlacement::new(
+            std::time::Duration::from_secs(900),
+        )));
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://worker@0".into(),
+            WorkerType::Regular,
+        ))];
+        let headers = [("x-session-id".to_string(), "episode.7".to_string())]
+            .into_iter()
+            .collect();
+        let (_, lease) = policy
+            .select_worker_with_lease(&workers, Some("{\"prompt_ids\":[1,2,3]}"), Some(&headers))
+            .unwrap();
+        policy.retire_session("episode.7");
+        assert_eq!(
+            policy.session_token_snapshot().unwrap().1["http://worker@0"],
+            3
+        );
+        assert!(policy
+            .select_worker_with_lease(&workers, Some("{\"prompt_ids\":[1]}"), Some(&headers))
+            .is_none());
+        drop(lease);
+        assert_eq!(
+            policy.session_token_snapshot().unwrap().1["http://worker@0"],
+            0
+        );
+        policy.retire_session("episode.7");
+        assert!(policy
+            .select_worker_with_lease(&workers, None, Some(&headers))
+            .is_none());
+    }
+
+    #[test]
     fn leased_hash_selection_matches_existing_hash_without_reservations() {
         let policy = ConsistentHashPolicy::with_placement(None);
         let workers: Vec<Arc<dyn Worker>> = (0..4)

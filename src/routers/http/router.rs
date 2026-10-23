@@ -2849,10 +2849,16 @@ mod tests {
         let (router, _, backends) = placement_fixture().await;
         let metadata: serde_json::Value =
             serde_json::from_str(&response_text(router.session_placement()).await).unwrap();
-        assert_eq!(
-            metadata,
-            serde_json::json!({"atomic_select_and_lease":true,"placement":"least_tokens"})
-        );
+        assert_eq!(metadata["atomic_select_and_lease"], true);
+        assert_eq!(metadata["placement"], "least_tokens");
+        assert_eq!(metadata["token_snapshot"]["version"], 1);
+        assert_eq!(metadata["token_snapshot"]["retirement"], true);
+        let rows = metadata["token_snapshot"]["workers"].as_array().unwrap();
+        assert_eq!(rows.len(), router.get_worker_urls().len());
+        assert!(rows.iter().all(|row| row["tracked_tokens"] == 0));
+        let receipt: serde_json::Value =
+            serde_json::from_str(&response_text(router.retire_session("done")).await).unwrap();
+        assert_eq!(receipt["retired_session_id"], "done");
         let reset: serde_json::Value =
             serde_json::from_str(&response_text(router.reset_session_placement().await).await)
                 .unwrap();
