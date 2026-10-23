@@ -336,6 +336,21 @@ impl TokenPlacement {
         for session in state.sessions.values_mut() {
             session.released = true;
         }
+        if self.kv_aware {
+            // The explicit weight-reset operation emptied the prefix cache.
+            // Idle old contexts must not become the next census load baseline:
+            // re-admitting them now allocates KV again. In-flight owners keep
+            // their existing reservation and abort routing until they settle.
+            let idle: Vec<_> = state
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.inflight == 0)
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in idle {
+                state.set_counted(&key, false);
+            }
+        }
         state.sessions.len()
     }
 
@@ -544,6 +559,36 @@ mod tests {
                 .0,
             "b@0"
         );
+    }
+
+    #[test]
+    fn kv_weight_reset_reserves_readmitted_idle_contexts_again() {
+        let placement = kv_placement(&[("a@0", 0.0, 1000), ("b@0", 0.0, 1000)]);
+        for i in 0..6 {
+            let (_, lease) = placement
+                .try_place_and_lease(&format!("s{i}"), Some(&body(100)), &["a@0", "b@0"])
+                .unwrap();
+            drop(lease);
+        }
+        assert_eq!(
+            tokens_on(&placement, "a@0") + tokens_on(&placement, "b@0"),
+            600
+        );
+        assert_eq!(placement.release_owners(), 6);
+        assert_eq!(
+            tokens_on(&placement, "a@0") + tokens_on(&placement, "b@0"),
+            0
+        );
+        publish(&placement, &[("a@0", 0.0, 1000), ("b@0", 0.0, 1000)]);
+        let admitted: Vec<_> = (0..18)
+            .filter_map(|i| {
+                placement.try_place_and_lease(&format!("s{i}"), Some(&body(100)), &["a@0", "b@0"])
+            })
+            .collect();
+        assert_eq!(admitted.len(), 16);
+        assert_eq!(tokens_on(&placement, "a@0"), 800);
+        assert_eq!(tokens_on(&placement, "b@0"), 800);
+        drop(admitted);
     }
 
     fn body(tokens: usize) -> String {
