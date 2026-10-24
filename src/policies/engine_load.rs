@@ -229,6 +229,26 @@ impl EngineLoadPolicy {
         instant: Instant,
         wall: f64,
     ) -> Option<(usize, Option<SessionLease>)> {
+        self.choose_kind(
+            workers,
+            text,
+            headers,
+            reserve,
+            instant,
+            wall,
+            abort_request(text),
+        )
+    }
+    fn choose_kind(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+        reserve: bool,
+        instant: Instant,
+        wall: f64,
+        abort: bool,
+    ) -> Option<(usize, Option<SessionLease>)> {
         let healthy = get_healthy_worker_indices(workers);
         if healthy.is_empty() {
             return None;
@@ -236,7 +256,6 @@ impl EngineLoadPolicy {
         let key = headers
             .and_then(hash_key::extract_hash_key_from_headers)
             .or_else(|| hash_key::extract_hash_key_from_body(text));
-        let abort = abort_request(text);
         let mut state = self.state.lock().unwrap();
         // Preserve the established abort-retention period. Only idle owners can
         // expire; after one idle period a generation loses affinity, while an
@@ -400,6 +419,38 @@ impl LoadBalancingPolicy for EngineLoadPolicy {
         headers: Option<&RequestHeaders>,
     ) -> Option<(usize, Option<SessionLease>)> {
         self.choose(workers, text, headers, true, Instant::now(), wall_time())
+    }
+    fn select_generation_worker_with_lease(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, Option<SessionLease>)> {
+        self.choose_kind(
+            workers,
+            text,
+            headers,
+            true,
+            Instant::now(),
+            wall_time(),
+            false,
+        )
+    }
+    fn select_control_worker_with_lease(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, Option<SessionLease>)> {
+        self.choose_kind(
+            workers,
+            text,
+            headers,
+            true,
+            Instant::now(),
+            wall_time(),
+            true,
+        )
     }
     fn update_engine_snapshot(
         &self,

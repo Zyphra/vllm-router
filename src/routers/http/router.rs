@@ -540,8 +540,11 @@ impl Router {
         // Convert headers for policies that need them (e.g., engine_load)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let (idx, lease) =
-            policy.select_worker_with_lease(&available, text, request_headers.as_ref())?;
+        let (idx, lease) = policy.select_generation_worker_with_lease(
+            &available,
+            text,
+            request_headers.as_ref(),
+        )?;
         Some((available[idx].clone(), lease))
     }
 
@@ -1736,11 +1739,20 @@ impl RouterTrait for Router {
         let policy = self.policy_registry.get_default_policy();
         let request_text = serde_json::to_string(&body).ok();
         let request_headers = Self::headers_to_request_headers(headers);
-        let (worker_idx, lease) = match policy.select_worker_with_lease(
-            &workers,
-            request_text.as_deref(),
-            request_headers.as_ref(),
-        ) {
+        let selection = if path.ends_with("/abort") {
+            policy.select_control_worker_with_lease(
+                &workers,
+                request_text.as_deref(),
+                request_headers.as_ref(),
+            )
+        } else {
+            policy.select_generation_worker_with_lease(
+                &workers,
+                request_text.as_deref(),
+                request_headers.as_ref(),
+            )
+        };
+        let (worker_idx, lease) = match selection {
             Some(idx) => idx,
             None => {
                 if policy.session_placement() == "engine_load"
@@ -2393,6 +2405,16 @@ mod tests {
                 }),
             )
             .route(
+                "/which-generation",
+                axum::routing::post({
+                    let url = url.clone();
+                    move || {
+                        let url = url.clone();
+                        async move { url }
+                    }
+                }),
+            )
+            .route(
                 "/failure",
                 axum::routing::post(|| async { StatusCode::BAD_GATEWAY }),
             );
@@ -2693,7 +2715,7 @@ mod tests {
                 router
                     .route_transparent(
                         Some(&headers),
-                        "/abort",
+                        "/which-generation",
                         &Method::POST,
                         serde_json::json!({"request_id":"next", "prompt_ids":[1]})
                     )
@@ -2738,7 +2760,7 @@ mod tests {
                 router
                     .route_transparent(
                         Some(&headers),
-                        "/abort",
+                        "/which-generation",
                         &Method::POST,
                         serde_json::json!({"request_id":"next", "prompt_ids":[1]})
                     )
@@ -2781,7 +2803,7 @@ mod tests {
         let successor = router
             .route_transparent(
                 Some(&headers),
-                "/abort",
+                "/which-generation",
                 &Method::POST,
                 serde_json::json!({"request_id":"next", "prompt_ids":[1]}),
             )
@@ -2836,7 +2858,7 @@ mod tests {
                 router
                     .route_transparent(
                         Some(&headers),
-                        "/abort",
+                        "/which-generation",
                         &Method::POST,
                         serde_json::json!({"request_id":"next", "prompt_ids":[1]})
                     )

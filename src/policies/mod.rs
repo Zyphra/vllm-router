@@ -108,6 +108,23 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
             .map(|idx| (idx, None))
     }
 
+    fn select_generation_worker_with_lease(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, Option<SessionLease>)> {
+        self.select_worker_with_lease(workers, text, headers)
+    }
+    fn select_control_worker_with_lease(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, Option<SessionLease>)> {
+        self.select_worker_with_lease(workers, text, headers)
+    }
+
     /// Whether a refused selection is safe for a new-request retry.
     fn unselected_is_new_request(
         &self,
