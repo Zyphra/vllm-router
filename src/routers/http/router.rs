@@ -2968,6 +2968,9 @@ mod tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let router_thread = std::thread::spawn(move || {
             tokio::runtime::Builder::new_multi_thread().worker_threads(8).enable_all().build().unwrap().block_on(async move {
+                let metrics_socket=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let metrics_port=metrics_socket.local_addr().unwrap().port();drop(metrics_socket);
+                crate::metrics::start_prometheus(crate::metrics::PrometheusConfig{host:"127.0.0.1".into(),port:metrics_port});
                 let policy=Arc::new(crate::policies::EngineLoadPolicy::new());
                 let mut router=create_test_regular_router();
                 router.client=Client::builder().no_proxy().build().unwrap();
@@ -2986,7 +2989,7 @@ mod tests {
                 let state=Arc::new(AppState{router,context,concurrency_queue_tx:None,router_manager:None});
                 let app=build_app_with_request_tracing(state,16*1024*1024,vec![],vec![],true,false);
                 let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                ready_tx.send((format!("http://{}",listener.local_addr().unwrap()),urls)).unwrap();
+                ready_tx.send((format!("http://{}",listener.local_addr().unwrap()),urls,metrics_port)).unwrap();
                 tokio::select! { _=crate::server::unconstrained_accept(axum::serve(listener,app))=>{}, _=router_done=>{} }
             });
         });
@@ -2996,7 +2999,7 @@ mod tests {
             let samples=Arc::new(std::sync::Mutex::new(Vec::<(String,f64,u16)>::new()));
             let done=Arc::new(AtomicBool::new(false)); let next=Arc::new(AtomicUsize::new(0));
             let start=Instant::now(); let mut controls=Vec::new();
-            for kind in ["control_get","workers_get","snapshot_post","metrics_get"] {
+            for kind in ["control_get","workers_get","snapshot_post","metrics_get","engine_metrics_get"] {
                 let client=client.clone();let origin=origin.clone();let urls=urls.clone();let samples=samples.clone();let done=done.clone();
                 controls.push(tokio::spawn(async move {
                     let mut n=0;
@@ -3005,7 +3008,8 @@ mod tests {
                         let req=match kind {
                             "control_get"=>client.get(format!("{origin}/session_placement")),
                             "workers_get"=>client.get(format!("{origin}/list_workers")),
-                            "metrics_get"=>client.get(format!("http://127.0.{}.1:{backend_port}/metrics",n%72+1)),
+                            "metrics_get"=>client.get(format!("http://127.0.0.1:{metrics_port}/metrics")),
+                            "engine_metrics_get"=>client.get(format!("http://127.0.{}.1:{backend_port}/metrics",n%72+1)),
                             _=>{
                                 let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
                                 client.post(format!("{origin}/session_placement")).json(&serde_json::json!({"workers":urls.iter().map(|u|serde_json::json!({"worker_url":u,"observed_at":now,"running":0,"waiting":0,"kv_usage":0.1})).collect::<Vec<_>>()}))
@@ -3033,7 +3037,7 @@ mod tests {
             let generation_s=start.elapsed().as_secs_f64();done.store(true,Ordering::Relaxed);
             for task in controls {task.await.unwrap();}
             let mut rows=serde_json::Map::new();
-            for kind in ["typed_generation","native_generation","control_get","workers_get","snapshot_post","metrics_get"] {
+            for kind in ["typed_generation","native_generation","control_get","workers_get","snapshot_post","metrics_get","engine_metrics_get"] {
                 let guard=samples.lock().unwrap();let mut values=guard.iter().filter(|r|r.0==kind).map(|r|r.1).collect::<Vec<_>>();values.sort_by(f64::total_cmp);
                 let percentile=|q:f64| {let x=q*(values.len()-1)as f64;let i=x.floor()as usize;values[i]+(values[(i+1).min(values.len()-1)]-values[i])*(x-i as f64)};
                 let errors=guard.iter().filter(|r|r.0==kind && r.2!=200).count();
