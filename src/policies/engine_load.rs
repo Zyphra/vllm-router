@@ -1152,4 +1152,9 @@ mod tests {
             &w.iter().map(|w| w.url().into()).collect::<Vec<_>>(),
             101.0,
         )
-        .u
+        .unwrap();
+        assert!(p
+            .choose(&w, None, None, true, Instant::now(), 101.0)
+            .is_none());
+    }
+}
