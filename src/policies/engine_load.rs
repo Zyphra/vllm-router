@@ -48,6 +48,8 @@ struct Session {
 #[derive(Debug, Default)]
 struct State {
     readings: HashMap<String, Reading>,
+    host_ids: HashMap<String, Arc<str>>,
+    last_gc: Option<Instant>,
     watermarks: HashMap<String, EngineObservation>,
     sessions: HashMap<String, Session>,
     epoch: u64,
@@ -194,10 +196,17 @@ impl EngineLoadPolicy {
         registered: &[String],
         now: f64,
     ) -> Result<usize, String> {
+        // Canonical host identity and membership are prepared off the placement
+        // lock once per census, rather than reparsed for every generation.
+        let registered_set: HashSet<&str> = registered.iter().map(String::as_str).collect();
+        let host_ids: HashMap<String, Arc<str>> = registered
+            .iter()
+            .map(|url| (url.clone(), Arc::from(host(url))))
+            .collect();
         let mut state = self.state.lock().unwrap();
         let mut seen = HashSet::new();
         for row in &snapshot.workers {
-            if !registered.contains(&row.worker_url)
+            if !registered_set.contains(row.worker_url.as_str())
                 || !seen.insert(&row.worker_url)
                 || !row.observed_at.is_finite()
                 || row.observed_at <= 0.0
@@ -216,7 +225,10 @@ impl EngineLoadPolicy {
                 }
             }
         }
-        state.watermarks.retain(|url, _| registered.contains(url));
+        state
+            .watermarks
+            .retain(|url, _| registered_set.contains(url.as_str()));
+        state.host_ids = host_ids;
         for row in &snapshot.workers {
             state.watermarks.insert(row.worker_url.clone(), row.clone());
         }
@@ -278,14 +290,56 @@ impl EngineLoadPolicy {
         let key = headers
             .and_then(hash_key::extract_hash_key_from_headers)
             .or_else(|| hash_key::extract_hash_key_from_body(text));
-        let mut state = self.state.lock().unwrap();
+        let selected = {
+            let mut state = self.state.lock().unwrap();
+            self.choose_locked(
+                &mut state, workers, &healthy, key, reserve, instant, wall, abort,
+            )
+        };
+        if let Some((idx, _)) = &selected {
+            workers[*idx].increment_processed();
+            RouterMetrics::record_processed_request(workers[*idx].url());
+            RouterMetrics::record_policy_decision(self.name(), workers[*idx].url());
+        }
+        selected
+    }
+
+    fn choose_locked(
+        &self,
+        state: &mut State,
+        workers: &[Arc<dyn Worker>],
+        healthy: &[usize],
+        key: Option<String>,
+        reserve: bool,
+        instant: Instant,
+        wall: f64,
+        abort: bool,
+    ) -> Option<(usize, Option<SessionLease>)> {
         // Preserve the established abort-retention period. Only idle owners can
         // expire; after one idle period a generation loses affinity, while an
         // abort can still find its exact owner for four idle periods.
-        state.sessions.retain(|_, session| {
-            session.inflight > 0
-                || instant.saturating_duration_since(session.last_settled) <= self.idle * 4
-        });
+        let retention = self.idle.saturating_mul(4);
+        let gc_period = self.idle.min(Duration::from_secs(30));
+        if state
+            .last_gc
+            .is_none_or(|last| instant.saturating_duration_since(last) >= gc_period)
+        {
+            state.sessions.retain(|_, session| {
+                session.inflight > 0
+                    || instant.saturating_duration_since(session.last_settled) <= retention
+            });
+            state.last_gc = Some(instant);
+        }
+        // Expire the addressed key exactly even between global sweeps. Inflight
+        // owners still never expire, and a late abort cannot reach an old owner.
+        if let Some(key) = &key {
+            if state.sessions.get(key).is_some_and(|session| {
+                session.inflight == 0
+                    && instant.saturating_duration_since(session.last_settled) > retention
+            }) {
+                state.sessions.remove(key);
+            }
+        }
         let resident = key.as_ref().and_then(|key| state.sessions.get(key));
         let owner = resident.and_then(|s| {
             healthy
@@ -293,19 +347,32 @@ impl EngineLoadPolicy {
                 .copied()
                 .find(|&i| workers[i].url() == s.worker)
         });
+        let keep_affinity = resident.is_some_and(|session| {
+            !session.released
+                && instant.saturating_duration_since(session.last_settled) <= self.idle
+        });
         // A failed/unhealthy owner is NEVER replaced while outstanding, nor on
         // abort. Returning no route is safer than aborting an unrelated engine.
         if resident.is_some_and(|s| s.inflight > 0) || abort {
             let idx = owner?;
-            return self.reserve_locked(
-                &mut state, workers, idx, key, reserve, !abort, false, instant,
-            );
+            return self.reserve_locked(state, workers, idx, key, reserve, !abort, false, instant);
         }
 
-        let mut hosts: HashMap<String, (usize, usize)> = HashMap::new();
+        let mut hosts: HashMap<Arc<str>, (usize, usize)> = HashMap::new();
         let mut fresh = Vec::new();
-        for &idx in &healthy {
-            let counts = hosts.entry(host(workers[idx].url())).or_default();
+        for &idx in healthy {
+            let url = workers[idx].url();
+            let host_id = match state.host_ids.get(url) {
+                Some(value) => Arc::clone(value),
+                None => {
+                    // An immediately hot-added worker may precede its first
+                    // census; cache its identity once, without inventing load.
+                    let value: Arc<str> = Arc::from(host(url));
+                    state.host_ids.insert(url.to_owned(), Arc::clone(&value));
+                    value
+                }
+            };
+            let counts = hosts.entry(Arc::clone(&host_id)).or_default();
             counts.0 += 1;
             if let Some(reading) = state.readings.get(workers[idx].url()).filter(|r| {
                 wall >= r.observation.observed_at
@@ -321,6 +388,7 @@ impl EngineLoadPolicy {
                         .saturating_add(reading.pending),
                     reading.observation.kv_usage,
                     reading.last_selected,
+                    host_id,
                 ));
             }
         }
@@ -333,24 +401,21 @@ impl EngineLoadPolicy {
             // Missing feedback cannot introduce a new blind placement. Existing
             // sessions retain their known owner until fresh feedback returns.
             let idx = owner?;
-            return self
-                .reserve_locked(&mut state, workers, idx, key, reserve, true, false, instant);
+            return self.reserve_locked(state, workers, idx, key, reserve, true, false, instant);
         }
-        fresh.retain(|(idx, _, _, _)| complete.contains(&host(workers[*idx].url())));
+        fresh.retain(|(_, _, _, _, host_id)| complete.contains(host_id));
         if fresh.is_empty() {
             return None;
         }
-        let mut loads: Vec<_> = fresh.iter().map(|(_, load, _, _)| *load).collect();
+        let mut loads: Vec<_> = fresh.iter().map(|(_, load, _, _, _)| *load).collect();
         loads.sort_unstable();
         let median = (loads[(loads.len() - 1) / 2] as f64 + loads[loads.len() / 2] as f64) / 2.0;
-        let keep = resident.is_some_and(|session| {
-            !session.released
-                && instant.saturating_duration_since(session.last_settled) <= self.idle
-        }) && owner.is_some_and(|idx| {
-            fresh.iter().any(|(i, load, _, _)| {
-                *i == idx && (*load == 0 || (*load as f64) < self.spill_factor * median)
-            })
-        });
+        let keep = keep_affinity
+            && owner.is_some_and(|idx| {
+                fresh.iter().any(|(i, load, _, _, _)| {
+                    *i == idx && (*load == 0 || (*load as f64) < self.spill_factor * median)
+                })
+            });
         let idx = if keep {
             owner.unwrap()
         } else {
@@ -364,7 +429,7 @@ impl EngineLoadPolicy {
                 .unwrap()
                 .0
         };
-        self.reserve_locked(&mut state, workers, idx, key, reserve, true, true, instant)
+        self.reserve_locked(state, workers, idx, key, reserve, true, true, instant)
     }
 
     fn reserve_locked(
@@ -413,9 +478,6 @@ impl EngineLoadPolicy {
                 session.inflight += 1;
             }
         }
-        workers[idx].increment_processed();
-        RouterMetrics::record_processed_request(&worker);
-        RouterMetrics::record_policy_decision(self.name(), &worker);
         if reserve {
             workers[idx].increment_load();
         }
@@ -558,6 +620,52 @@ mod tests {
     }
     fn headers() -> RequestHeaders {
         HashMap::from([("x-session-id".to_owned(), "episode".to_owned())])
+    }
+    #[test]
+    fn addressed_expiry_is_exact_between_bounded_sweeps_and_inflight_never_expires() {
+        let p = EngineLoadPolicy::with_parameters(Duration::from_secs(10), 2.0);
+        let w = workers();
+        let h = headers();
+        let now = Instant::now();
+        {
+            let mut state = p.state.lock().unwrap();
+            state.last_gc = Some(now);
+            for (key, age, inflight) in [
+                ("episode", 41, 0),
+                ("unaddressed", 41, 0),
+                ("retained", 35, 0),
+                ("outstanding", 100, 1),
+            ] {
+                state.sessions.insert(
+                    key.into(),
+                    Session {
+                        worker: w[0].url().to_owned(),
+                        inflight,
+                        last_settled: now - Duration::from_secs(age),
+                        released: false,
+                    },
+                );
+            }
+        }
+        let abort = Some(r#"{"request_ids":["r"]}"#);
+        assert!(p.choose(&w, abort, Some(&h), false, now, 100.0).is_none());
+        // The global sweep did not run merely because a request arrived.
+        assert!(p.state.lock().unwrap().sessions.contains_key("unaddressed"));
+        for key in ["retained", "outstanding"] {
+            let headers = HashMap::from([("x-session-id".into(), key.into())]);
+            assert_eq!(
+                p.choose(&w, abort, Some(&headers), false, now, 100.0)
+                    .unwrap()
+                    .0,
+                0
+            );
+        }
+        // A periodic sweep clears only settled expired owners.
+        p.choose(&w, None, None, false, now + Duration::from_secs(10), 100.0);
+        let state = p.state.lock().unwrap();
+        assert!(!state.sessions.contains_key("unaddressed"));
+        assert!(!state.sessions.contains_key("retained"));
+        assert_eq!(state.sessions["outstanding"].inflight, 1);
     }
     fn publish(p: &EngineLoadPolicy, w: &[Arc<dyn Worker>], queues: &[u64], kv: &[f64], time: f64) {
         p.update_at(
