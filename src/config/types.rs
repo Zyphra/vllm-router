@@ -238,11 +238,8 @@ pub enum PolicyConfig {
         load_check_interval_secs: u64,
     },
 
-    #[serde(rename = "consistent_hash")]
-    ConsistentHash {
-        /// Number of virtual nodes per worker for better distribution
-        virtual_nodes: u32,
-    },
+    #[serde(rename = "engine_load")]
+    EngineLoad,
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
@@ -255,7 +252,7 @@ impl PolicyConfig {
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
-            PolicyConfig::ConsistentHash { .. } => "consistent_hash",
+            PolicyConfig::EngineLoad => "engine_load",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
         }
     }

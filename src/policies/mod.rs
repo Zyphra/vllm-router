@@ -9,7 +9,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 mod cache_aware;
-mod consistent_hash;
+mod engine_load;
 mod factory;
 mod hash_key;
 mod power_of_two;
@@ -17,18 +17,15 @@ mod random;
 mod registry;
 mod rendezvous_hash;
 mod round_robin;
-mod session_placement;
 
 pub use cache_aware::CacheAwarePolicy;
-pub use consistent_hash::ConsistentHashPolicy;
-pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
+pub use engine_load::{EngineLoadPolicy, EngineObservation, EngineSnapshot, SessionLease};
 pub use factory::PolicyFactory;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
-pub use session_placement::{SessionLease, TokenPlacement};
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value
@@ -54,7 +51,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 
     /// Select a single worker with optional HTTP headers for routing decisions
     ///
-    /// Policies like consistent_hash can use headers (e.g., X-Session-ID) for routing.
+    /// Policies like engine_load can use headers (e.g., X-Session-ID) for routing.
     /// Default implementation ignores headers and falls back to basic selection.
     fn select_worker_with_headers(
         &self,
@@ -111,9 +108,43 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
             .map(|idx| (idx, None))
     }
 
+    fn select_generation_worker_with_lease(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, Option<SessionLease>)> {
+        self.select_worker_with_lease(workers, text, headers)
+    }
+    fn select_control_worker_with_lease(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, Option<SessionLease>)> {
+        self.select_worker_with_lease(workers, text, headers)
+    }
+
+    /// Whether a refused selection is safe for a new-request retry.
+    fn unselected_is_new_request(
+        &self,
+        _text: Option<&str>,
+        _headers: Option<&RequestHeaders>,
+    ) -> bool {
+        false
+    }
+
     /// Effective session placement mode, for capability admission.
     fn session_placement(&self) -> &'static str {
-        "hash"
+        "none"
+    }
+
+    fn update_engine_snapshot(
+        &self,
+        _snapshot: EngineSnapshot,
+        _registered: &[String],
+    ) -> Result<usize, String> {
+        Err("engine-load feedback is not supported by this policy".into())
     }
 
     /// Forget session ownership because every worker's prefix cache was reset

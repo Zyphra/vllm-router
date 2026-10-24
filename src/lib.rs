@@ -25,7 +25,7 @@ pub enum PolicyType {
     RoundRobin,
     CacheAware,
     PowerOfTwo,
-    ConsistentHash,
+    EngineLoad,
 }
 
 #[pyclass]
@@ -122,9 +122,7 @@ impl Router {
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5, // Default value
                 },
-                PolicyType::ConsistentHash => ConfigPolicyConfig::ConsistentHash {
-                    virtual_nodes: 160, // Default value
-                },
+                PolicyType::EngineLoad => ConfigPolicyConfig::EngineLoad,
             }
         };
 

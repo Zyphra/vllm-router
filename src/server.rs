@@ -544,6 +544,17 @@ async fn reset_session_placement(
     state.router.reset_session_placement().await
 }
 
+async fn update_session_placement(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(snapshot): Json<crate::policies::EngineSnapshot>,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    state.router.update_session_placement(snapshot)
+}
+
 async fn get_loads(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
@@ -791,7 +802,10 @@ pub fn build_app_with_request_tracing(
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
         .route("/reset_session_placement", post(reset_session_placement))
-        .route("/session_placement", get(session_placement))
+        .route(
+            "/session_placement",
+            get(session_placement).post(update_session_placement),
+        )
         .route("/get_loads", get(get_loads));
 
     // Worker management routes

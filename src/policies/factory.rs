@@ -1,8 +1,8 @@
 //! Factory for creating load balancing policies
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    CacheAwareConfig, CacheAwarePolicy, EngineLoadPolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
+    RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -33,10 +33,10 @@ impl PolicyFactory {
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
-            PolicyConfig::ConsistentHash { virtual_nodes: _ } => {
+            PolicyConfig::EngineLoad => {
                 // Note: virtual_nodes parameter is available but not currently used
                 // The consistent hash policy uses a hardcoded value for now
-                Arc::new(ConsistentHashPolicy::new())
+                Arc::new(EngineLoadPolicy::new())
             }
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
         }
@@ -49,7 +49,7 @@ impl PolicyFactory {
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
-            "consistent_hash" | "consistenthash" => Some(Arc::new(ConsistentHashPolicy::new())),
+            "engine_load" | "engineload" => Some(Arc::new(EngineLoadPolicy::new())),
             "rendezvous_hash" | "rendezvoushash" => Some(Arc::new(RendezvousHashPolicy::new())),
             _ => None,
         }
@@ -86,10 +86,9 @@ mod tests {
         });
         assert_eq!(policy.name(), "cache_aware");
 
-        // Test ConsistentHash
-        let policy =
-            PolicyFactory::create_from_config(&PolicyConfig::ConsistentHash { virtual_nodes: 160 });
-        assert_eq!(policy.name(), "consistent_hash");
+        // Test EngineLoad
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::EngineLoad);
+        assert_eq!(policy.name(), "engine_load");
 
         // Test RendezvousHash
         let policy = PolicyFactory::create_from_config(&PolicyConfig::RendezvousHash);
@@ -106,8 +105,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
-        assert!(PolicyFactory::create_by_name("consistent_hash").is_some());
-        assert!(PolicyFactory::create_by_name("ConsistentHash").is_some());
+        assert!(PolicyFactory::create_by_name("engine_load").is_some());
+        assert!(PolicyFactory::create_by_name("EngineLoad").is_some());
         assert!(PolicyFactory::create_by_name("rendezvous_hash").is_some());
         assert!(PolicyFactory::create_by_name("RendezvousHash").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());

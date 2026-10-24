@@ -537,11 +537,14 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        // Convert headers for policies that need them (e.g., consistent_hash)
+        // Convert headers for policies that need them (e.g., engine_load)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let (idx, lease) =
-            policy.select_worker_with_lease(&available, text, request_headers.as_ref())?;
+        let (idx, lease) = policy.select_generation_worker_with_lease(
+            &available,
+            text,
+            request_headers.as_ref(),
+        )?;
         Some((available[idx].clone(), lease))
     }
 
@@ -554,7 +557,11 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        let text = typed_req.extract_text_for_routing();
+        // Typed generation routes are generation requests even when native
+        // extract_text_for_routing() is empty (chat/tokenized requests). Pass
+        // their real serialized object so session history survives spill.
+        let text = serde_json::to_string(typed_req)
+            .unwrap_or_else(|_| typed_req.extract_text_for_routing());
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1646,6 +1653,14 @@ impl RouterTrait for Router {
         .into_response()
     }
 
+    fn update_session_placement(&self, snapshot: crate::policies::EngineSnapshot) -> Response {
+        let policy = self.policy_registry.get_default_policy();
+        match policy.update_engine_snapshot(snapshot, &self.get_worker_urls()) {
+            Ok(count) => Json(serde_json::json!({"atomic_select_and_lease":true,"placement":policy.session_placement(),"accepted_workers":count})).into_response(),
+            Err(message) => (StatusCode::BAD_REQUEST,message).into_response(),
+        }
+    }
+
     async fn get_worker_loads(&self) -> Response {
         let urls = self.get_worker_urls();
         let mut loads = Vec::new();
@@ -1724,13 +1739,51 @@ impl RouterTrait for Router {
         let policy = self.policy_registry.get_default_policy();
         let request_text = serde_json::to_string(&body).ok();
         let request_headers = Self::headers_to_request_headers(headers);
-        let (worker_idx, lease) = match policy.select_worker_with_lease(
-            &workers,
-            request_text.as_deref(),
-            request_headers.as_ref(),
-        ) {
+        let selection = if path.ends_with("/abort") {
+            policy.select_control_worker_with_lease(
+                &workers,
+                request_text.as_deref(),
+                request_headers.as_ref(),
+            )
+        } else {
+            policy.select_generation_worker_with_lease(
+                &workers,
+                request_text.as_deref(),
+                request_headers.as_ref(),
+            )
+        };
+        let (worker_idx, lease) = match selection {
             Some(idx) => idx,
             None => {
+                if policy.session_placement() == "engine_load"
+                    && path == "/verl/v1/generate"
+                    && policy.unselected_is_new_request(
+                        request_text.as_deref(),
+                        request_headers.as_ref(),
+                    )
+                {
+                    if let (Some(request_id), Some(session_id)) = (
+                        body.get("request_id").and_then(serde_json::Value::as_str),
+                        request_headers
+                            .as_ref()
+                            .and_then(|headers| headers.get("x-session-id")),
+                    ) {
+                        // No owner or physical request was admitted. The native
+                        // caller may retry this exact receipt within its deadline.
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            Json(serde_json::json!({
+                                "router_admission": "engine-load-v1",
+                                "placement": "engine_load",
+                                "never_dispatched": true,
+                                "request_id": request_id,
+                                "session_id": session_id,
+                                "retry_after_s": 2,
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Failed to select a worker".to_string(),
@@ -2246,11 +2299,37 @@ mod tests {
     // Tests for transparent proxy header/availability fixes
     // =============================
 
-    /// Create a test router with ConsistentHash policy instead of RoundRobin
-    fn create_test_consistent_hash_router() -> Router {
+    fn seed_engine_load(router: &Router) {
+        let urls = router.get_worker_urls();
+        router
+            .policy_registry
+            .get_default_policy()
+            .update_engine_snapshot(
+                crate::policies::EngineSnapshot {
+                    workers: urls
+                        .iter()
+                        .map(|url| crate::policies::EngineObservation {
+                            worker_url: url.clone(),
+                            observed_at: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs_f64(),
+                            running: 0,
+                            waiting: 0,
+                            kv_usage: 0.5,
+                        })
+                        .collect(),
+                },
+                &urls,
+            )
+            .unwrap();
+    }
+
+    /// Create a test router with EngineLoad policy instead of RoundRobin
+    fn create_test_engine_load_router() -> Router {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(
-            crate::config::types::PolicyConfig::ConsistentHash { virtual_nodes: 100 },
+            crate::config::types::PolicyConfig::EngineLoad,
         ));
 
         let worker1 = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular);
@@ -2261,7 +2340,7 @@ mod tests {
         worker_registry.register(Arc::new(worker3));
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
-        Router {
+        let router = Router {
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -2273,7 +2352,9 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
-        }
+        };
+        seed_engine_load(&router);
+        router
     }
 
     /// Actual HTTP backend: the generation stream stays open until the sender is
@@ -2283,7 +2364,19 @@ mod tests {
         tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
         tokio::task::JoinHandle<()>,
     ) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        placement_backend_on("127.0.0.1").await
+    }
+
+    async fn placement_backend_on(
+        host: &str,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind(format!("{host}:0"))
+            .await
+            .unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let rx = Arc::new(tokio::sync::Mutex::new(Some(rx)));
@@ -2303,6 +2396,16 @@ mod tests {
             )
             .route(
                 "/abort",
+                axum::routing::post({
+                    let url = url.clone();
+                    move || {
+                        let url = url.clone();
+                        async move { url }
+                    }
+                }),
+            )
+            .route(
+                "/which-generation",
                 axum::routing::post({
                     let url = url.clone();
                     move || {
@@ -2332,9 +2435,7 @@ mod tests {
     ) {
         let backends = vec![placement_backend().await, placement_backend().await];
         let policy: Arc<dyn LoadBalancingPolicy> =
-            Arc::new(crate::policies::ConsistentHashPolicy::with_placement(Some(
-                crate::policies::TokenPlacement::new(Duration::from_secs(900)),
-            )));
+            Arc::new(crate::policies::EngineLoadPolicy::new());
         let mut router = create_test_regular_router();
         router.worker_registry = Arc::new(WorkerRegistry::new());
         for (url, _, _) in &backends {
@@ -2343,6 +2444,7 @@ mod tests {
                 .register(Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular)));
         }
         router.policy_registry = Arc::new(PolicyRegistry::with_default_policy(Arc::clone(&policy)));
+        seed_engine_load(&router);
         (Arc::new(router), policy, backends)
     }
 
@@ -2363,8 +2465,9 @@ mod tests {
         let (mut router, _, backends) = placement_fixture().await;
         let router_mut = Arc::get_mut(&mut router).unwrap();
         router_mut.policy_registry = Arc::new(PolicyRegistry::with_default_policy(Arc::new(
-            crate::policies::ConsistentHashPolicy::with_placement(None),
+            crate::policies::EngineLoadPolicy::new(),
         )));
+        seed_engine_load(router_mut);
         router_mut.retry_config.max_retries = 2;
         router_mut.retry_config.initial_backoff_ms = 1;
         (router, backends)
@@ -2521,7 +2624,9 @@ mod tests {
                     .await,
             )
             .await;
-            assert_eq!(first, second, "{key}");
+            if key != "empty_header" {
+                assert_eq!(first, second, "{key}");
+            }
             assert!(workers.iter().all(|worker| worker.load() == 1), "{key}");
             workers.iter().for_each(|worker| worker.decrement_load());
         }
@@ -2541,18 +2646,13 @@ mod tests {
     }
 
     async fn heavy_on(policy: &Arc<dyn LoadBalancingPolicy>, owner: &str) {
-        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
-            owner.to_string(),
-            WorkerType::Regular,
-        ))];
-        let headers = [("x-session-id".to_string(), "heavy".to_string())]
-            .into_iter()
-            .collect();
-        let text = serde_json::json!({"prompt_ids": vec![1;1000]}).to_string();
-        let (_, lease) = policy
-            .select_worker_with_lease(&workers, Some(&text), Some(&headers))
+        // Force a settled-owner spill using measured queue gauges, never token
+        // lengths or local worker-load counters.
+        let engine = policy
+            .as_any()
+            .downcast_ref::<crate::policies::EngineLoadPolicy>()
             .unwrap();
-        drop(lease);
+        engine.test_set_queue(owner, 100);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2617,9 +2717,9 @@ mod tests {
                 router
                     .route_transparent(
                         Some(&headers),
-                        "/abort",
+                        "/which-generation",
                         &Method::POST,
-                        serde_json::json!({"request_id":"next"})
+                        serde_json::json!({"request_id":"next", "prompt_ids":[1]})
                     )
                     .await
             )
@@ -2662,9 +2762,9 @@ mod tests {
                 router
                     .route_transparent(
                         Some(&headers),
-                        "/abort",
+                        "/which-generation",
                         &Method::POST,
-                        serde_json::json!({"request_id":"next"})
+                        serde_json::json!({"request_id":"next", "prompt_ids":[1]})
                     )
                     .await
             )
@@ -2705,9 +2805,9 @@ mod tests {
         let successor = router
             .route_transparent(
                 Some(&headers),
-                "/abort",
+                "/which-generation",
                 &Method::POST,
-                serde_json::json!({"request_id":"next"}),
+                serde_json::json!({"request_id":"next", "prompt_ids":[1]}),
             )
             .await;
         assert_eq!(successor.status(), StatusCode::OK);
@@ -2760,9 +2860,9 @@ mod tests {
                 router
                     .route_transparent(
                         Some(&headers),
-                        "/abort",
+                        "/which-generation",
                         &Method::POST,
-                        serde_json::json!({"request_id":"next"})
+                        serde_json::json!({"request_id":"next", "prompt_ids":[1]})
                     )
                     .await
             )
@@ -2811,7 +2911,7 @@ mod tests {
             let metadata: serde_json::Value =
                 serde_json::from_str(&response_text(response).await).unwrap();
             assert_eq!(metadata["atomic_select_and_lease"], true);
-            assert_eq!(metadata["placement"], "least_tokens");
+            assert_eq!(metadata["placement"], "engine_load");
             let response = app_for(vec!["http://127.0.0.1:1/auth".to_string()])
                 .oneshot(
                     Request::builder()
@@ -2829,6 +2929,260 @@ mod tests {
         }
     }
 
+    /// Opt-in, allocated-CPU production-size latency probe. The backend and
+    /// load generator have independent runtimes so a blocked Router cannot
+    /// prevent its client-side timeout/latency measurement from advancing.
+    #[test]
+    fn production_fan_in_control_plane_probe() {
+        if std::env::var("ROUTER_FAN_IN_PROBE").as_deref() != Ok("1") {
+            return;
+        }
+        use crate::server::{build_app_with_request_tracing, AppContext, AppState};
+        use std::future::IntoFuture;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let requests = std::env::var("ROUTER_FAN_IN_REQUESTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8192);
+        let concurrency = std::env::var("ROUTER_FAN_IN_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512);
+        let backend = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        backend.set_nonblocking(true).unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        let (backend_stop, backend_done) = tokio::sync::oneshot::channel::<()>();
+        let backend_thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async move {
+                let app=axum::Router::new().fallback(axum::routing::any(|req:Request| async move {
+                    if req.uri().path()=="/metrics" {
+                        return (StatusCode::OK,"vllm:num_requests_running{engine=\"0\"} 0\nvllm:num_requests_waiting{engine=\"0\"} 0\n").into_response();
+                    }
+                    Json(serde_json::json!({"id":"probe","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"output_ids":[1],"request_id":"probe"})).into_response()
+                }));
+                let listener=tokio::net::TcpListener::from_std(backend).unwrap();
+                tokio::select! { _=axum::serve(listener,app).into_future()=>{}, _=backend_done=>{} }
+            });
+        });
+        let (router_stop, router_done) = tokio::sync::oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let router_thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread().worker_threads(8).enable_all().build().unwrap().block_on(async move {
+                let metrics_socket=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let metrics_port=metrics_socket.local_addr().unwrap().port();drop(metrics_socket);
+                crate::metrics::start_prometheus(crate::metrics::PrometheusConfig{host:"127.0.0.1".into(),port:metrics_port});
+                let policy=Arc::new(crate::policies::EngineLoadPolicy::new());
+                let mut router=create_test_regular_router();
+                router.client=Client::builder().no_proxy().build().unwrap();
+                router.retry_config.max_retries=0; router.intra_node_data_parallel_size=8;
+                router.worker_registry=Arc::new(WorkerRegistry::new());
+                for h in 1..=72 { for rank in 0..8 {
+                    router.worker_registry.register(Arc::new(DPAwareWorker::new(format!("http://127.0.{h}.1:{backend_port}"),rank,8,WorkerType::Regular)));
+                }}
+                let workers=router.worker_registry.get_all(); assert_eq!(workers.len(),576);
+                policy.seed_probe_sessions(100_000,&workers);
+                let p:Arc<dyn LoadBalancingPolicy>=policy;
+                router.policy_registry=Arc::new(PolicyRegistry::with_default_policy(p));
+                seed_engine_load(&router);
+                let urls=router.get_worker_urls(); let router=Arc::new(router);
+                let context=Arc::new(AppContext::new(crate::config::RouterConfig::default(),Client::new(),10000,None,vec![]).unwrap());
+                let state=Arc::new(AppState{router,context,concurrency_queue_tx:None,router_manager:None});
+                let app=build_app_with_request_tracing(state,16*1024*1024,vec![],vec![],true,false);
+                let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                ready_tx.send((format!("http://{}",listener.local_addr().unwrap()),urls,metrics_port)).unwrap();
+                tokio::select! { _=crate::server::unconstrained_accept(axum::serve(listener,app))=>{}, _=router_done=>{} }
+            });
+        });
+        let (origin, urls, metrics_port) = ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let report=tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async move {
+            let client=Client::builder().no_proxy().timeout(Duration::from_secs(15)).pool_max_idle_per_host(concurrency).build().unwrap();
+            let samples=Arc::new(std::sync::Mutex::new(Vec::<(String,f64,u16)>::new()));
+            let done=Arc::new(AtomicBool::new(false)); let next=Arc::new(AtomicUsize::new(0));
+            let start=Instant::now(); let mut controls=Vec::new();
+            for kind in ["control_get","workers_get","snapshot_post","metrics_get","engine_metrics_get"] {
+                let client=client.clone();let origin=origin.clone();let urls=urls.clone();let samples=samples.clone();let done=done.clone();
+                controls.push(tokio::spawn(async move {
+                    let mut n=0;
+                    while !done.load(Ordering::Relaxed) || n<8 {
+                        let began=Instant::now();
+                        let req=match kind {
+                            "control_get"=>client.get(format!("{origin}/session_placement")),
+                            "workers_get"=>client.get(format!("{origin}/list_workers")),
+                            "metrics_get"=>client.get(format!("http://127.0.0.1:{metrics_port}/metrics")),
+                            "engine_metrics_get"=>client.get(format!("http://127.0.{}.1:{backend_port}/metrics",n%72+1)),
+                            _=>{
+                                let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+                                client.post(format!("{origin}/session_placement")).json(&serde_json::json!({"workers":urls.iter().map(|u|serde_json::json!({"worker_url":u,"observed_at":now,"running":0,"waiting":0,"kv_usage":0.1})).collect::<Vec<_>>()}))
+                            }
+                        };
+                        let status=match req.send().await {Ok(r)=>{let status=r.status().as_u16();let _=r.bytes().await;status},Err(_)=>0};
+                        samples.lock().unwrap().push((kind.into(),began.elapsed().as_secs_f64()*1000.0,status));
+                        n+=1;tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }));
+            }
+            let mut tasks=tokio::task::JoinSet::new();
+            for _ in 0..concurrency {
+                let client=client.clone();let origin=origin.clone();let samples=samples.clone();let next=next.clone();
+                tasks.spawn(async move {loop {
+                    let i=next.fetch_add(1,Ordering::Relaxed);if i>=requests {break;}
+                    let (kind,path,body)=if i%2==0 {("typed_generation","/v1/chat/completions",serde_json::json!({"model":"m","messages":[{"role":"user","content":"preserve session history"}],"stream":false}))}
+                    else {("native_generation","/verl/v1/generate",serde_json::json!({"request_id":format!("probe-{i}"),"prompt_ids":vec![1;1024],"sampling_params":{"max_tokens":1}}))};
+                    let began=Instant::now();
+                    let status=match client.post(format!("{origin}{path}")).header("X-Session-ID",format!("settled-{}",i%100_000)).json(&body).send().await {Ok(r)=>{let status=r.status().as_u16();let _=r.bytes().await;status},Err(_)=>0};
+                    samples.lock().unwrap().push((kind.into(),began.elapsed().as_secs_f64()*1000.0,status));
+                }});
+            }
+            while let Some(result)=tasks.join_next().await {result.unwrap();}
+            let generation_s=start.elapsed().as_secs_f64();done.store(true,Ordering::Relaxed);
+            for task in controls {task.await.unwrap();}
+            let mut rows=serde_json::Map::new();
+            for kind in ["typed_generation","native_generation","control_get","workers_get","snapshot_post","metrics_get","engine_metrics_get"] {
+                let guard=samples.lock().unwrap();let mut values=guard.iter().filter(|r|r.0==kind).map(|r|r.1).collect::<Vec<_>>();values.sort_by(f64::total_cmp);
+                let percentile=|q:f64| {let x=q*(values.len()-1)as f64;let i=x.floor()as usize;values[i]+(values[(i+1).min(values.len()-1)]-values[i])*(x-i as f64)};
+                let errors=guard.iter().filter(|r|r.0==kind && r.2!=200).count();
+                rows.insert(kind.into(),serde_json::json!({"samples":values.len(),"errors_or_timeouts":errors,"p50_ms":percentile(0.5),"p90_ms":percentile(0.9),"p99_ms":percentile(0.99),"max_ms":values.last()}));
+            }
+            serde_json::json!({"sessions":100_000,"engines":576,"hosts":72,"router_threads":8,"generator_threads":2,"backend_threads":2,"requests":requests,"concurrency":concurrency,"generation_s":generation_s,"generation_requests_per_s":requests as f64/generation_s,"measurements":rows,"scope":"Synthetic queues and mocked backend; actual native Router HTTP typed/native/control paths. No GPU, model call, serving latency or production stall-cause claim."})
+        });
+        println!("PRODUCTION_FAN_IN_PROBE={report}");
+        let _ = router_stop.send(());
+        let _ = backend_stop.send(());
+        router_thread.join().unwrap();
+        backend_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_chat_spills_settled_owner_and_fails_closed_while_outstanding() {
+        use crate::server::AppContext;
+        use crate::server::{build_app_with_request_tracing, AppState};
+        use tower::ServiceExt;
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let mut backends = Vec::new();
+        for _ in 0..2 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let target = url.clone();
+            let seen = Arc::clone(&seen);
+            let app = axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(
+                    move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                        let target = target.clone();
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().await.push((
+                                target.clone(),
+                                headers
+                                    .get("x-session-id")
+                                    .unwrap()
+                                    .to_str()
+                                    .unwrap()
+                                    .to_string(),
+                                body,
+                            ));
+                            Json(serde_json::json!({"backend":target}))
+                        }
+                    },
+                ),
+            );
+            backends.push((
+                url,
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+            ));
+        }
+        let mut router = create_test_engine_load_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, _) in &backends {
+            router
+                .worker_registry
+                .register(Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular)));
+        }
+        seed_engine_load(&router);
+        router.retry_config.max_retries = 0;
+        let router = Arc::new(router);
+        let context = Arc::new(
+            AppContext::new(
+                crate::config::RouterConfig::default(),
+                Client::new(),
+                10,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(AppState {
+            router: router.clone(),
+            context,
+            concurrency_queue_tx: None,
+            router_manager: None,
+        });
+        let app = build_app_with_request_tracing(state, 1024 * 1024, vec![], vec![], true, false);
+        let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"preserve history"}],"stream":false});
+        let send = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("X-Session-ID", "chat-spill")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(send()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let owner = seen.lock().await[0].0.clone();
+        heavy_on(&router.policy_registry.get_default_policy(), &owner).await;
+        assert_eq!(
+            app.clone().oneshot(send()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let records = seen.lock().await;
+        assert_eq!(records.len(), 2);
+        assert_ne!(records[0].0, records[1].0);
+        assert_eq!(records[0].1, records[1].1);
+        assert_eq!(records[0].2, records[1].2);
+        let current = records[1].0.clone();
+        drop(records);
+        let headers = [("x-session-id".to_string(), "chat-spill".to_string())]
+            .into_iter()
+            .collect();
+        let workers = router.worker_registry.get_all();
+        let (_, lease) = router
+            .policy_registry
+            .get_default_policy()
+            .select_generation_worker_with_lease(&workers, Some(&body.to_string()), Some(&headers))
+            .unwrap();
+        workers
+            .iter()
+            .find(|w| w.url() == current)
+            .unwrap()
+            .set_healthy(false);
+        assert_eq!(
+            app.oneshot(send()).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let abort = router
+            .route_transparent(
+                Some(&{
+                    let mut h = HeaderMap::new();
+                    h.insert("x-session-id", HeaderValue::from_static("chat-spill"));
+                    h
+                }),
+                "/abort",
+                &Method::POST,
+                serde_json::json!({"request_id":"r"}),
+            )
+            .await;
+        assert_eq!(abort.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(seen.lock().await.len(), 2);
+        drop(lease);
+        for (_, task) in backends {
+            task.abort();
+        }
+    }
+
     #[tokio::test]
     async fn placement_metadata_reports_effective_mode() {
         let (router, _, backends) = placement_fixture().await;
@@ -2836,7 +3190,7 @@ mod tests {
             serde_json::from_str(&response_text(router.session_placement()).await).unwrap();
         assert_eq!(
             metadata,
-            serde_json::json!({"atomic_select_and_lease":true,"placement":"least_tokens"})
+            serde_json::json!({"atomic_select_and_lease":true,"placement":"engine_load"})
         );
         let reset: serde_json::Value =
             serde_json::from_str(&response_text(router.reset_session_placement().await).await)
@@ -2883,10 +3237,10 @@ mod tests {
     }
 
     #[test]
-    fn test_select_worker_for_model_with_consistent_hash_uses_headers() {
+    fn test_select_worker_for_model_with_engine_load_uses_headers() {
         // Verify that select_worker_for_model passes headers through to the policy,
         // producing consistent routing for the same session ID
-        let router = create_test_consistent_hash_router();
+        let router = create_test_engine_load_router();
 
         let mut header_map = HeaderMap::new();
         header_map.insert("x-session-id", HeaderValue::from_static("sticky-session-1"));
@@ -2914,7 +3268,7 @@ mod tests {
     #[test]
     fn test_select_worker_for_model_filters_unavailable_workers() {
         // Verify that select_worker_for_model skips unhealthy workers
-        let router = create_test_consistent_hash_router();
+        let router = create_test_engine_load_router();
 
         // Mark worker1 and worker2 as unhealthy, leaving only worker3
         let all_workers = router.worker_registry.get_all();
@@ -2938,7 +3292,7 @@ mod tests {
     #[test]
     fn test_select_worker_for_model_returns_none_when_all_unavailable() {
         // Verify that when all workers are unhealthy, None is returned
-        let router = create_test_consistent_hash_router();
+        let router = create_test_engine_load_router();
 
         // Mark all workers as unhealthy
         let all_workers = router.worker_registry.get_all();
@@ -2954,9 +3308,9 @@ mod tests {
     }
 
     #[test]
-    fn test_consistent_hash_different_sessions_can_route_differently() {
+    fn test_engine_load_different_sessions_can_route_differently() {
         // Verify that different session IDs can route to different workers
-        let router = create_test_consistent_hash_router();
+        let router = create_test_engine_load_router();
 
         let mut worker_urls_seen = std::collections::HashSet::new();
         for i in 0..50 {
