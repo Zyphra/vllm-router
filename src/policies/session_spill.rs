@@ -139,14 +139,15 @@ impl QueuePressure {
         let waiting = *fresh.get(&resident)?;
         let mut counts: Vec<_> = fresh.values().copied().collect();
         counts.sort_unstable();
-        let median = counts[(counts.len() - 1) / 2];
-        let threshold = (config.minimum_waiting as f64).max(config.waiting_ratio * median as f64);
+        let median =
+            (counts[(counts.len() - 1) / 2] as f64 + counts[counts.len() / 2] as f64) / 2.0;
+        let threshold = (config.minimum_waiting as f64).max(config.waiting_ratio * median);
         if waiting as f64 <= threshold {
             return None;
         }
         let candidates: HashSet<_> = fresh
             .into_iter()
-            .filter(|(host, count)| *host != resident && *count <= median)
+            .filter(|(host, count)| *host != resident && *count as f64 <= median)
             .map(|(host, _)| host)
             .collect();
         if candidates.is_empty() {
