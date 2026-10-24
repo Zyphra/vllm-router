@@ -5,8 +5,8 @@
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    CacheAwareConfig, CacheAwarePolicy, EngineLoadPolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
+    RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
 };
 use crate::config::types::PolicyConfig;
 use std::collections::HashMap;
@@ -172,6 +172,11 @@ impl PolicyRegistry {
         model_id: &str,
         policy_hint: Option<&str>,
     ) -> Arc<dyn LoadBalancingPolicy> {
+        // Engine-load placement is shared across typed/model and transparent
+        // paths. A worker hint cannot fork ownership or bypass census guards.
+        if self.default_policy.name() == "engine_load" {
+            return Arc::clone(&self.default_policy);
+        }
         // 1. Check policy hint from worker
         if let Some(policy_type) = policy_hint {
             debug!("Using policy hint '{}' for model {}", policy_type, model_id);
@@ -220,7 +225,7 @@ impl PolicyRegistry {
                 Arc::new(CacheAwarePolicy::with_config(cache_config))
             }
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
-            PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
+            PolicyConfig::EngineLoad { .. } => Arc::new(EngineLoadPolicy::new()),
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
         }
     }

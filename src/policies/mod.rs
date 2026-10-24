@@ -9,30 +9,23 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 mod cache_aware;
-mod consistent_hash;
+mod engine_load;
 mod factory;
 mod hash_key;
-mod kv_capacity;
 mod power_of_two;
 mod random;
 mod registry;
 mod rendezvous_hash;
 mod round_robin;
-mod session_placement;
-mod session_spill;
 
 pub use cache_aware::CacheAwarePolicy;
-pub use consistent_hash::ConsistentHashPolicy;
-pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
+pub use engine_load::{EngineLoadPolicy, EngineObservation, EngineSnapshot, SessionLease};
 pub use factory::PolicyFactory;
-pub use kv_capacity::{KvObservation, KvSnapshot};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
-pub use session_placement::{SessionLease, TokenPlacement};
-pub use session_spill::{PlacementSnapshot, QueueObservation, QueueSnapshot, SessionSpillConfig};
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value
@@ -58,7 +51,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 
     /// Select a single worker with optional HTTP headers for routing decisions
     ///
-    /// Policies like consistent_hash can use headers (e.g., X-Session-ID) for routing.
+    /// Policies like engine_load can use headers (e.g., X-Session-ID) for routing.
     /// Default implementation ignores headers and falls back to basic selection.
     fn select_worker_with_headers(
         &self,
@@ -115,17 +108,26 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
             .map(|idx| (idx, None))
     }
 
-    /// Effective session placement mode, for capability admission.
-    fn session_placement(&self) -> &'static str {
-        "hash"
+    /// Whether a refused selection is safe for a new-request retry.
+    fn unselected_is_new_request(
+        &self,
+        _text: Option<&str>,
+        _headers: Option<&RequestHeaders>,
+    ) -> bool {
+        false
     }
 
-    fn update_kv_snapshot(
+    /// Effective session placement mode, for capability admission.
+    fn session_placement(&self) -> &'static str {
+        "none"
+    }
+
+    fn update_engine_snapshot(
         &self,
-        _snapshot: KvSnapshot,
+        _snapshot: EngineSnapshot,
         _registered: &[String],
     ) -> Result<usize, String> {
-        Err("KV session placement is not supported by this policy".into())
+        Err("engine-load feedback is not supported by this policy".into())
     }
 
     /// Forget session ownership because every worker's prefix cache was reset
@@ -133,14 +135,6 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Returns the number of sessions released.
     fn release_session_owners(&self) -> usize {
         0 // Default: the policy keeps no session ownership
-    }
-
-    fn update_queue_snapshot(
-        &self,
-        _snapshot: QueueSnapshot,
-        _registered: &[String],
-    ) -> Result<usize, String> {
-        Err("queue spill placement is disabled".into())
     }
 
     /// Get policy name for metrics and debugging

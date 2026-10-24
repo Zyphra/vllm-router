@@ -537,7 +537,7 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        // Convert headers for policies that need them (e.g., consistent_hash)
+        // Convert headers for policies that need them (e.g., engine_load)
         let request_headers = Self::headers_to_request_headers(headers);
 
         let (idx, lease) =
@@ -1646,22 +1646,9 @@ impl RouterTrait for Router {
         .into_response()
     }
 
-    fn update_session_placement(&self, snapshot: crate::policies::KvSnapshot) -> Response {
+    fn update_session_placement(&self, snapshot: crate::policies::EngineSnapshot) -> Response {
         let policy = self.policy_registry.get_default_policy();
-        match policy.update_kv_snapshot(snapshot, &self.get_worker_urls()) {
-            Ok(count) => Json(serde_json::json!({
-                "atomic_select_and_lease": true,
-                "placement": policy.session_placement(),
-                "accepted_workers": count,
-            }))
-            .into_response(),
-            Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
-        }
-    }
-
-    fn update_session_queue(&self, snapshot: crate::policies::QueueSnapshot) -> Response {
-        let policy = self.policy_registry.get_default_policy();
-        match policy.update_queue_snapshot(snapshot, &self.get_worker_urls()) {
+        match policy.update_engine_snapshot(snapshot, &self.get_worker_urls()) {
             Ok(count) => Json(serde_json::json!({"atomic_select_and_lease":true,"placement":policy.session_placement(),"accepted_workers":count})).into_response(),
             Err(message) => (StatusCode::BAD_REQUEST,message).into_response(),
         }
@@ -1752,7 +1739,13 @@ impl RouterTrait for Router {
         ) {
             Some(idx) => idx,
             None => {
-                if policy.session_placement() == "kv_aware" && path == "/verl/v1/generate" {
+                if policy.session_placement() == "engine_load"
+                    && path == "/verl/v1/generate"
+                    && policy.unselected_is_new_request(
+                        request_text.as_deref(),
+                        request_headers.as_ref(),
+                    )
+                {
                     if let (Some(request_id), Some(session_id)) = (
                         body.get("request_id").and_then(serde_json::Value::as_str),
                         request_headers
@@ -1764,12 +1757,12 @@ impl RouterTrait for Router {
                         return (
                             StatusCode::TOO_MANY_REQUESTS,
                             Json(serde_json::json!({
-                                "router_admission": "kv-capacity-v1",
-                                "placement": "kv_aware",
+                                "router_admission": "engine-load-v1",
+                                "placement": "engine_load",
                                 "never_dispatched": true,
                                 "request_id": request_id,
                                 "session_id": session_id,
-                                "retry_after_s": 10,
+                                "retry_after_s": 2,
                             })),
                         )
                             .into_response();
@@ -1885,85 +1878,6 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-
-    #[tokio::test]
-    async fn kv_capacity_receipt_precedes_any_backend_dispatch_and_recovers() {
-        use crate::policies::{ConsistentHashPolicy, KvObservation, KvSnapshot, TokenPlacement};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let calls = Arc::new(AtomicUsize::new(0));
-        let captured = calls.clone();
-        let backend = tokio::spawn(async move {
-            let app = axum::Router::new().route(
-                "/verl/v1/generate",
-                axum::routing::post(move || {
-                    captured.fetch_add(1, Ordering::SeqCst);
-                    async { Json(serde_json::json!({"ok": true})) }
-                }),
-            );
-            axum::serve(listener, app).await.unwrap();
-        });
-        let mut router = create_test_regular_router();
-        router.worker_registry = Arc::new(WorkerRegistry::new());
-        router
-            .worker_registry
-            .register(Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular)));
-        router.policy_registry = Arc::new(PolicyRegistry::with_default_policy(Arc::new(
-            ConsistentHashPolicy::with_placement(Some(
-                TokenPlacement::new(Duration::from_secs(900)).with_kv_capacity(),
-            )),
-        )));
-        let snapshot = |usage| KvSnapshot {
-            workers: vec![KvObservation {
-                worker_url: url.clone(),
-                kv_usage: usage,
-                waiting: 0,
-                capacity_tokens: 1000,
-                observed_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs_f64(),
-            }],
-        };
-        assert_eq!(
-            router.update_session_placement(snapshot(0.9)).status(),
-            StatusCode::OK
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert("x-session-id", HeaderValue::from_static("s"));
-        let body = serde_json::json!({"request_id": "r", "prompt_ids": [1, 2]});
-        let response = router
-            .route_transparent(
-                Some(&headers),
-                "/verl/v1/generate",
-                &Method::POST,
-                body.clone(),
-            )
-            .await;
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        let receipt: serde_json::Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
-        assert_eq!(
-            receipt,
-            serde_json::json!({
-                "router_admission": "kv-capacity-v1", "placement": "kv_aware", "never_dispatched": true,
-                "request_id": "r", "session_id": "s", "retry_after_s": 10,
-            })
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            router.update_session_placement(snapshot(0.1)).status(),
-            StatusCode::OK
-        );
-        let response = router
-            .route_transparent(Some(&headers), "/verl/v1/generate", &Method::POST, body)
-            .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let _ = to_bytes(response.into_body(), 4096).await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        backend.abort();
-    }
 
     fn create_test_regular_router() -> Router {
         // Create registries
@@ -2369,11 +2283,37 @@ mod tests {
     // Tests for transparent proxy header/availability fixes
     // =============================
 
-    /// Create a test router with ConsistentHash policy instead of RoundRobin
-    fn create_test_consistent_hash_router() -> Router {
+    fn seed_engine_load(router: &Router) {
+        let urls = router.get_worker_urls();
+        router
+            .policy_registry
+            .get_default_policy()
+            .update_engine_snapshot(
+                crate::policies::EngineSnapshot {
+                    workers: urls
+                        .iter()
+                        .map(|url| crate::policies::EngineObservation {
+                            worker_url: url.clone(),
+                            observed_at: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs_f64(),
+                            running: 0,
+                            waiting: 0,
+                            kv_usage: 0.5,
+                        })
+                        .collect(),
+                },
+                &urls,
+            )
+            .unwrap();
+    }
+
+    /// Create a test router with EngineLoad policy instead of RoundRobin
+    fn create_test_engine_load_router() -> Router {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(
-            crate::config::types::PolicyConfig::ConsistentHash { virtual_nodes: 100 },
+            crate::config::types::PolicyConfig::EngineLoad,
         ));
 
         let worker1 = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular);
@@ -2384,7 +2324,7 @@ mod tests {
         worker_registry.register(Arc::new(worker3));
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
-        Router {
+        let router = Router {
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -2396,7 +2336,9 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
-        }
+        };
+        seed_engine_load(&router);
+        router
     }
 
     /// Actual HTTP backend: the generation stream stays open until the sender is
@@ -2456,109 +2398,6 @@ mod tests {
         (url, tx, task)
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn judge_router_spills_next_call_after_settlement_but_keeps_abort_and_stream_owner() {
-        use crate::policies::{QueueObservation, QueueSnapshot, SessionSpillConfig};
-        let mut backends = vec![
-            placement_backend_on("127.0.0.1").await,
-            placement_backend_on("127.0.0.2").await,
-            placement_backend_on("127.0.0.3").await,
-        ];
-        let policy: Arc<dyn LoadBalancingPolicy> =
-            Arc::new(crate::policies::ConsistentHashPolicy::with_placement(Some(
-                crate::policies::TokenPlacement::new(Duration::from_secs(900))
-                    .with_queue_spill(SessionSpillConfig::default())
-                    .unwrap(),
-            )));
-        let mut router = create_test_regular_router();
-        router.client = Client::builder().no_proxy().build().unwrap();
-        router.worker_registry = Arc::new(WorkerRegistry::new());
-        for (url, _, _) in &backends {
-            router
-                .worker_registry
-                .register(Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular)));
-        }
-        router.policy_registry = Arc::new(PolicyRegistry::with_default_policy(policy));
-        let headers = placement_headers();
-        let request = serde_json::json!({"prompt_ids":[1,2],"request_id":"judge"});
-        let generation = router
-            .route_transparent(
-                Some(&headers),
-                "/native_generate",
-                &Method::POST,
-                request.clone(),
-            )
-            .await;
-        assert_eq!(generation.status(), StatusCode::OK);
-        let abort = serde_json::json!({"request_id":"judge"});
-        let owner = response_text(
-            router
-                .route_transparent(Some(&headers), "/abort", &Method::POST, abort.clone())
-                .await,
-        )
-        .await;
-        let snapshot = QueueSnapshot {
-            workers: backends
-                .iter()
-                .map(|(url, _, _)| QueueObservation {
-                    worker_url: url.clone(),
-                    observed_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs_f64(),
-                    waiting: if *url == owner { 1200 } else { 20 },
-                })
-                .collect(),
-        };
-        assert_eq!(
-            router.update_session_queue(snapshot).status(),
-            StatusCode::OK
-        );
-        assert_eq!(
-            response_text(
-                router
-                    .route_transparent(Some(&headers), "/abort", &Method::POST, abort.clone())
-                    .await
-            )
-            .await,
-            owner
-        );
-        let index = backends
-            .iter()
-            .position(|(url, _, _)| *url == owner)
-            .unwrap();
-        let (_, sender, owner_task) = backends.remove(index);
-        drop(sender);
-        let _ = response_text(generation).await;
-        // An idle abort still addresses the original host; only a fresh generation may spill.
-        assert_eq!(
-            response_text(
-                router
-                    .route_transparent(Some(&headers), "/abort", &Method::POST, abort.clone())
-                    .await
-            )
-            .await,
-            owner
-        );
-        let next = router
-            .route_transparent(Some(&headers), "/native_generate", &Method::POST, request)
-            .await;
-        assert_eq!(next.status(), StatusCode::OK);
-        let moved = response_text(
-            router
-                .route_transparent(Some(&headers), "/abort", &Method::POST, abort)
-                .await,
-        )
-        .await;
-        assert_ne!(moved, owner);
-        for (_, sender, task) in backends {
-            drop(sender);
-            task.abort();
-        }
-        drop(next);
-        owner_task.abort();
-    }
-
     async fn placement_fixture() -> (
         Arc<Router>,
         Arc<dyn LoadBalancingPolicy>,
@@ -2570,9 +2409,7 @@ mod tests {
     ) {
         let backends = vec![placement_backend().await, placement_backend().await];
         let policy: Arc<dyn LoadBalancingPolicy> =
-            Arc::new(crate::policies::ConsistentHashPolicy::with_placement(Some(
-                crate::policies::TokenPlacement::new(Duration::from_secs(900)),
-            )));
+            Arc::new(crate::policies::EngineLoadPolicy::new());
         let mut router = create_test_regular_router();
         router.worker_registry = Arc::new(WorkerRegistry::new());
         for (url, _, _) in &backends {
@@ -2581,6 +2418,7 @@ mod tests {
                 .register(Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular)));
         }
         router.policy_registry = Arc::new(PolicyRegistry::with_default_policy(Arc::clone(&policy)));
+        seed_engine_load(&router);
         (Arc::new(router), policy, backends)
     }
 
@@ -2601,8 +2439,9 @@ mod tests {
         let (mut router, _, backends) = placement_fixture().await;
         let router_mut = Arc::get_mut(&mut router).unwrap();
         router_mut.policy_registry = Arc::new(PolicyRegistry::with_default_policy(Arc::new(
-            crate::policies::ConsistentHashPolicy::with_placement(None),
+            crate::policies::EngineLoadPolicy::new(),
         )));
+        seed_engine_load(router_mut);
         router_mut.retry_config.max_retries = 2;
         router_mut.retry_config.initial_backoff_ms = 1;
         (router, backends)
@@ -3049,7 +2888,7 @@ mod tests {
             let metadata: serde_json::Value =
                 serde_json::from_str(&response_text(response).await).unwrap();
             assert_eq!(metadata["atomic_select_and_lease"], true);
-            assert_eq!(metadata["placement"], "least_tokens");
+            assert_eq!(metadata["placement"], "engine_load");
             let response = app_for(vec!["http://127.0.0.1:1/auth".to_string()])
                 .oneshot(
                     Request::builder()
@@ -3074,7 +2913,7 @@ mod tests {
             serde_json::from_str(&response_text(router.session_placement()).await).unwrap();
         assert_eq!(
             metadata,
-            serde_json::json!({"atomic_select_and_lease":true,"placement":"least_tokens"})
+            serde_json::json!({"atomic_select_and_lease":true,"placement":"engine_load"})
         );
         let reset: serde_json::Value =
             serde_json::from_str(&response_text(router.reset_session_placement().await).await)
@@ -3121,10 +2960,10 @@ mod tests {
     }
 
     #[test]
-    fn test_select_worker_for_model_with_consistent_hash_uses_headers() {
+    fn test_select_worker_for_model_with_engine_load_uses_headers() {
         // Verify that select_worker_for_model passes headers through to the policy,
         // producing consistent routing for the same session ID
-        let router = create_test_consistent_hash_router();
+        let router = create_test_engine_load_router();
 
         let mut header_map = HeaderMap::new();
         header_map.insert("x-session-id", HeaderValue::from_static("sticky-session-1"));
@@ -3152,7 +2991,7 @@ mod tests {
     #[test]
     fn test_select_worker_for_model_filters_unavailable_workers() {
         // Verify that select_worker_for_model skips unhealthy workers
-        let router = create_test_consistent_hash_router();
+        let router = create_test_engine_load_router();
 
         // Mark worker1 and worker2 as unhealthy, leaving only worker3
         let all_workers = router.worker_registry.get_all();
@@ -3176,7 +3015,7 @@ mod tests {
     #[test]
     fn test_select_worker_for_model_returns_none_when_all_unavailable() {
         // Verify that when all workers are unhealthy, None is returned
-        let router = create_test_consistent_hash_router();
+        let router = create_test_engine_load_router();
 
         // Mark all workers as unhealthy
         let all_workers = router.worker_registry.get_all();
@@ -3192,9 +3031,9 @@ mod tests {
     }
 
     #[test]
-    fn test_consistent_hash_different_sessions_can_route_differently() {
+    fn test_engine_load_different_sessions_can_route_differently() {
         // Verify that different session IDs can route to different workers
-        let router = create_test_consistent_hash_router();
+        let router = create_test_engine_load_router();
 
         let mut worker_urls_seen = std::collections::HashSet::new();
         for i in 0..50 {

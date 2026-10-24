@@ -1,10 +1,10 @@
 //! Shared hash key extraction for consistent hashing policies
 //!
 //! Extracts routing keys from HTTP headers and request bodies.
-//! Used by both ConsistentHashPolicy and RendezvousHashPolicy.
+//! Used by both EngineLoadPolicy and RendezvousHashPolicy.
 
 use super::RequestHeaders;
-use crate::policies::ConsistentHashPolicy;
+
 use tracing::debug;
 
 /// HTTP header names to check for session ID (case-insensitive, checked in order)
@@ -45,7 +45,7 @@ pub(crate) fn extract_hash_key(
     // 3. Final fallback: hash of request body
     let text = request_text.unwrap_or("");
     if text.len() > 100 {
-        format!("request_hash:{:016x}", ConsistentHashPolicy::fbi_hash(text))
+        format!("request_hash:{:016x}", StableHash::fbi_hash(text))
     } else {
         format!("request:{}", text)
     }
@@ -475,5 +475,213 @@ mod tests {
     fn test_find_field_start_missing() {
         let text = r#"{"other": "value"}"#;
         assert_eq!(find_field_start(text, "field"), None);
+    }
+}
+
+/// Stable key primitive; no placement or worker ownership lives here.
+pub(crate) struct StableHash;
+impl StableHash {
+    fn murmur_hash_64a(key: &[u8], seed: u32) -> u64 {
+        const M: u64 = 0xc6a4a7935bd1e995;
+        const R: i32 = 47;
+
+        let mut h = (seed as u64) ^ ((key.len() as u64).wrapping_mul(M));
+
+        // Process 8-byte chunks
+        let chunks = key.chunks_exact(8);
+        let remainder = chunks.remainder();
+
+        for chunk in chunks {
+            let mut k = u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ]);
+
+            k = k.wrapping_mul(M);
+            k ^= k >> R;
+            k = k.wrapping_mul(M);
+
+            h ^= k;
+            h = h.wrapping_mul(M);
+        }
+
+        // Process remaining bytes
+        match remainder.len() {
+            7 => {
+                h ^= (remainder[6] as u64) << 48;
+                h ^= (remainder[5] as u64) << 40;
+                h ^= (remainder[4] as u64) << 32;
+                h ^= (remainder[3] as u64) << 24;
+                h ^= (remainder[2] as u64) << 16;
+                h ^= (remainder[1] as u64) << 8;
+                h ^= remainder[0] as u64;
+                h = h.wrapping_mul(M);
+            }
+            6 => {
+                h ^= (remainder[5] as u64) << 40;
+                h ^= (remainder[4] as u64) << 32;
+                h ^= (remainder[3] as u64) << 24;
+                h ^= (remainder[2] as u64) << 16;
+                h ^= (remainder[1] as u64) << 8;
+                h ^= remainder[0] as u64;
+                h = h.wrapping_mul(M);
+            }
+            5 => {
+                h ^= (remainder[4] as u64) << 32;
+                h ^= (remainder[3] as u64) << 24;
+                h ^= (remainder[2] as u64) << 16;
+                h ^= (remainder[1] as u64) << 8;
+                h ^= remainder[0] as u64;
+                h = h.wrapping_mul(M);
+            }
+            4 => {
+                h ^= (remainder[3] as u64) << 24;
+                h ^= (remainder[2] as u64) << 16;
+                h ^= (remainder[1] as u64) << 8;
+                h ^= remainder[0] as u64;
+                h = h.wrapping_mul(M);
+            }
+            3 => {
+                h ^= (remainder[2] as u64) << 16;
+                h ^= (remainder[1] as u64) << 8;
+                h ^= remainder[0] as u64;
+                h = h.wrapping_mul(M);
+            }
+            2 => {
+                h ^= (remainder[1] as u64) << 8;
+                h ^= remainder[0] as u64;
+                h = h.wrapping_mul(M);
+            }
+            1 => {
+                h ^= remainder[0] as u64;
+                h = h.wrapping_mul(M);
+            }
+            _ => {}
+        }
+
+        h ^= h >> R;
+        h = h.wrapping_mul(M);
+        h ^= h >> R;
+
+        h
+    }
+
+    /// Optimized MurmurHash64A for rehashing uint64_t keys (from hash.c)
+    fn murmur_rehash_64a(k: u64) -> u64 {
+        const M: u64 = 0xc6a4a7935bd1e995;
+        const R: i32 = 47;
+        const SEED: u64 = 4193360111; // From hash.c
+
+        let mut h = SEED ^ (8u64.wrapping_mul(M)); // sizeof(uint64_t) * M
+
+        let mut k = k;
+        k = k.wrapping_mul(M);
+        k ^= k >> R;
+        k = k.wrapping_mul(M);
+
+        h ^= k;
+        h = h.wrapping_mul(M);
+
+        h ^= h >> R;
+        h = h.wrapping_mul(M);
+        h ^= h >> R;
+
+        h
+    }
+
+    /// FurcHash implementation from Facebook's mcrouter/lib/fbi/hash.c
+    /// This is the actual consistent hash function used by Facebook
+    fn furc_hash(key: &str, m: u32) -> u32 {
+        const MAX_TRIES: u32 = 32;
+        const FURC_SHIFT: u32 = 23;
+        const FURC_CACHE_SIZE: usize = 1024;
+
+        if m <= 1 {
+            return 0;
+        }
+
+        let key_bytes = key.as_bytes();
+        let mut hash_cache: Vec<u64> = Vec::with_capacity(FURC_CACHE_SIZE);
+        let mut old_ord: i32 = -1;
+
+        // Calculate d = ceil(log2(m))
+        let mut d = 0;
+        while m > (1u32 << d) {
+            d += 1;
+        }
+
+        let mut a = d;
+        for _try in 0..MAX_TRIES {
+            // Generate bits until we find a 1 bit or run out of depth
+            while !Self::furc_get_bit(key_bytes, a, &mut hash_cache, &mut old_ord) {
+                if d == 0 {
+                    return 0;
+                }
+                d -= 1;
+                a = d;
+            }
+
+            a += FURC_SHIFT;
+            let mut num = 1u32;
+
+            // Build the number bit by bit
+            for _ in 0..d.saturating_sub(1) {
+                num = (num << 1)
+                    | Self::furc_get_bit(key_bytes, a, &mut hash_cache, &mut old_ord) as u32;
+                a += FURC_SHIFT;
+            }
+
+            if num < m {
+                return num;
+            }
+        }
+
+        // Give up and return 0, which is always a legal value
+        0
+    }
+
+    /// Bit generator function from furc_hash (from hash.c)
+    fn furc_get_bit(key: &[u8], idx: u32, hash_cache: &mut Vec<u64>, old_ord: &mut i32) -> bool {
+        const SEED: u32 = 4193360111;
+
+        let ord = (idx >> 6) as i32; // idx / 64
+
+        // Extend hash cache if needed
+        if *old_ord < ord {
+            for n in (*old_ord + 1)..=ord {
+                let hash_value = if n == 0 {
+                    Self::murmur_hash_64a(key, SEED)
+                } else {
+                    Self::murmur_rehash_64a(hash_cache[(n - 1) as usize])
+                };
+
+                // Ensure cache has enough capacity
+                if hash_cache.len() <= n as usize {
+                    hash_cache.resize((n as usize) + 1, 0);
+                }
+                hash_cache[n as usize] = hash_value;
+            }
+            *old_ord = ord;
+        }
+
+        // Extract the bit
+        let hash_val = hash_cache[ord as usize];
+        let bit_pos = idx & 0x3f; // idx % 64
+        (hash_val >> bit_pos) & 0x1 != 0
+    }
+
+    /// Facebook-style hash function using furc_hash for consistent hashing
+    pub fn fbi_hash(key: &str) -> u64 {
+        // Use furc_hash with a large modulus to get good distribution
+        // Then expand to u64 for our hash ring
+        const LARGE_MODULUS: u32 = (1u32 << 23) - 1; // Max furc_hash modulus
+
+        let furc_result = Self::furc_hash(key, LARGE_MODULUS);
+
+        // Expand the 23-bit furc result to 64-bit by using MurmurHash
+        // This gives us the full 64-bit space while preserving consistency
+        Self::murmur_hash_64a(
+            &furc_result.to_le_bytes(),
+            4193360111, // Same seed as furc_hash
+        )
     }
 }

@@ -172,17 +172,10 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     }
 
     /// Update existing session placement from a control-plane KV census.
-    fn update_session_placement(&self, _snapshot: crate::policies::KvSnapshot) -> Response {
+    fn update_session_placement(&self, _snapshot: crate::policies::EngineSnapshot) -> Response {
         (
             axum::http::StatusCode::NOT_IMPLEMENTED,
             "KV session placement is not supported by this router",
-        )
-            .into_response()
-    }
-    fn update_session_queue(&self, _snapshot: crate::policies::QueueSnapshot) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "queue spill placement unsupported",
         )
             .into_response()
     }

@@ -12,11 +12,11 @@ use tracing::info;
 
 use super::get_healthy_worker_indices;
 use super::hash_key;
+use super::hash_key::StableHash;
 use super::LoadBalancingPolicy;
 use super::RequestHeaders;
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
-use crate::policies::ConsistentHashPolicy;
 
 /// Rendezvous hashing (Highest Random Weight) policy
 ///
@@ -59,7 +59,7 @@ impl LoadBalancingPolicy for RendezvousHashPolicy {
             .iter()
             .max_by_key(|&&idx| {
                 let score_key = format!("{}:{}", hash_key, workers[idx].url());
-                ConsistentHashPolicy::fbi_hash(&score_key)
+                StableHash::fbi_hash(&score_key)
             })
             .copied()
             .unwrap();
