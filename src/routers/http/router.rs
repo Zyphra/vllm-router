@@ -2928,6 +2928,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_chat_spills_settled_owner_and_fails_closed_while_outstanding() {
+        use crate::app_context::AppContext;
+        use crate::server::{build_app_with_request_tracing, AppState};
+        use tower::ServiceExt;
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let mut backends = Vec::new();
+        for _ in 0..2 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let target = url.clone();
+            let seen = Arc::clone(&seen);
+            let app = axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(
+                    move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                        let target = target.clone();
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().await.push((
+                                target.clone(),
+                                headers
+                                    .get("x-session-id")
+                                    .unwrap()
+                                    .to_str()
+                                    .unwrap()
+                                    .to_string(),
+                                body,
+                            ));
+                            Json(serde_json::json!({"backend":target}))
+                        }
+                    },
+                ),
+            );
+            backends.push((
+                url,
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+            ));
+        }
+        let mut router = create_test_engine_load_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, _) in &backends {
+            router
+                .worker_registry
+                .register(Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular)));
+        }
+        seed_engine_load(&router);
+        router.retry_config.max_retries = 0;
+        let router = Arc::new(router);
+        let context = Arc::new(
+            AppContext::new(
+                crate::config::RouterConfig::default(),
+                Client::new(),
+                10,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(AppState {
+            router: router.clone(),
+            context,
+            concurrency_queue_tx: None,
+            router_manager: None,
+        });
+        let app = build_app_with_request_tracing(state, 1024 * 1024, vec![], vec![], true, false);
+        let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"preserve history"}],"stream":false});
+        let send = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("X-Session-ID", "chat-spill")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(send()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let owner = seen.lock().await[0].0.clone();
+        heavy_on(&router.policy_registry.get_default_policy(), &owner).await;
+        assert_eq!(
+            app.clone().oneshot(send()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let records = seen.lock().await;
+        assert_eq!(records.len(), 2);
+        assert_ne!(records[0].0, records[1].0);
+        assert_eq!(records[0].1, records[1].1);
+        assert_eq!(records[0].2, records[1].2);
+        let current = records[1].0.clone();
+        drop(records);
+        let headers = [("x-session-id".to_string(), "chat-spill".to_string())]
+            .into_iter()
+            .collect();
+        let workers = router.worker_registry.get_all();
+        let (_, lease) = router
+            .policy_registry
+            .get_default_policy()
+            .select_generation_worker_with_lease(&workers, Some(&body.to_string()), Some(&headers))
+            .unwrap();
+        workers
+            .iter()
+            .find(|w| w.url() == current)
+            .unwrap()
+            .set_healthy(false);
+        assert_eq!(
+            app.oneshot(send()).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let abort = router
+            .route_transparent(
+                Some(&{
+                    let mut h = HeaderMap::new();
+                    h.insert("x-session-id", HeaderValue::from_static("chat-spill"));
+                    h
+                }),
+                "/abort",
+                &Method::POST,
+                serde_json::json!({"request_id":"r"}),
+            )
+            .await;
+        assert_eq!(abort.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(seen.lock().await.len(), 2);
+        drop(lease);
+        for (_, task) in backends {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn placement_metadata_reports_effective_mode() {
         let (router, _, backends) = placement_fixture().await;
         let metadata: serde_json::Value =
