@@ -130,6 +130,15 @@ impl Default for EngineLoadPolicy {
 }
 
 impl EngineLoadPolicy {
+    #[cfg(test)]
+    pub(crate) fn test_set_queue(&self, owner: &str, queue: u64) {
+        let mut state = self.state.lock().unwrap();
+        for (url, reading) in &mut state.readings {
+            reading.observation.running = 0;
+            reading.observation.waiting = if url == owner { queue } else { 0 };
+            reading.observation.observed_at = wall_time();
+        }
+    }
     pub fn new() -> Self {
         let idle = std::env::var("VLLM_ROUTER_SESSION_IDLE_SECS")
             .ok()
@@ -294,9 +303,9 @@ impl EngineLoadPolicy {
             !session.released
                 && instant.saturating_duration_since(session.last_settled) <= self.idle
         }) && owner.is_some_and(|idx| {
-            fresh
-                .iter()
-                .any(|(i, load, _, _)| *i == idx && *load as f64 <= self.spill_factor * median)
+            fresh.iter().any(|(i, load, _, _)| {
+                *i == idx && (*load == 0 || (*load as f64) < self.spill_factor * median)
+            })
         });
         let idx = if keep {
             owner.unwrap()

@@ -2622,18 +2622,13 @@ mod tests {
     }
 
     async fn heavy_on(policy: &Arc<dyn LoadBalancingPolicy>, owner: &str) {
-        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
-            owner.to_string(),
-            WorkerType::Regular,
-        ))];
-        let headers = [("x-session-id".to_string(), "heavy".to_string())]
-            .into_iter()
-            .collect();
-        let text = serde_json::json!({"prompt_ids": vec![1;1000]}).to_string();
-        let (_, lease) = policy
-            .select_worker_with_lease(&workers, Some(&text), Some(&headers))
+        // Force a settled-owner spill using measured queue gauges, never token
+        // lengths or local worker-load counters.
+        let engine = policy
+            .as_any()
+            .downcast_ref::<crate::policies::EngineLoadPolicy>()
             .unwrap();
-        drop(lease);
+        engine.test_set_queue(owner, 100);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2700,7 +2695,7 @@ mod tests {
                         Some(&headers),
                         "/abort",
                         &Method::POST,
-                        serde_json::json!({"request_id":"next"})
+                        serde_json::json!({"request_id":"next", "prompt_ids":[1]})
                     )
                     .await
             )
@@ -2745,7 +2740,7 @@ mod tests {
                         Some(&headers),
                         "/abort",
                         &Method::POST,
-                        serde_json::json!({"request_id":"next"})
+                        serde_json::json!({"request_id":"next", "prompt_ids":[1]})
                     )
                     .await
             )
@@ -2788,7 +2783,7 @@ mod tests {
                 Some(&headers),
                 "/abort",
                 &Method::POST,
-                serde_json::json!({"request_id":"next"}),
+                serde_json::json!({"request_id":"next", "prompt_ids":[1]}),
             )
             .await;
         assert_eq!(successor.status(), StatusCode::OK);
@@ -2843,7 +2838,7 @@ mod tests {
                         Some(&headers),
                         "/abort",
                         &Method::POST,
-                        serde_json::json!({"request_id":"next"})
+                        serde_json::json!({"request_id":"next", "prompt_ids":[1]})
                     )
                     .await
             )
