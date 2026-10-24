@@ -64,19 +64,19 @@ python -m build && pip install --force-reinstall dist/*.whl
 # When data-parallel-size > 1, the router automatically creates DP-aware workers
 ./target/release/vllm-router \
     --worker-urls http://worker1:8000 http://worker2:8000 \
-    --policy consistent_hash \
+    --policy engine_load \
     --intra-node-data-parallel-size 8
 
 # Alternative: using cargo run
 cargo run --release -- \
     --worker-urls http://worker1:8000 http://worker2:8000 \
-    --policy consistent_hash \
+    --policy engine_load \
     --intra-node-data-parallel-size 8
 
 # Alternative: using python launcher
 vllm-router \
   --worker-urls http://worker1:8000 http://worker2:8000 \
-    --policy consistent_hash \
+    --policy engine_load \
     --intra-node-data-parallel-size 8
 ```
 
@@ -85,7 +85,7 @@ vllm-router \
 # When vLLM runs the NIXL connector, prefill/decode URLs are required.
 # See a working example in scripts/llama3.1/ folder.
 cargo run --release -- \
-    --policy consistent_hash \
+    --policy engine_load \
     --vllm-pd-disaggregation \
     --prefill http://127.0.0.1:8081 \
     --prefill http://127.0.0.1:8082 \
@@ -101,20 +101,20 @@ cargo run --release -- \
 # When vLLM runs the NCCL connector, ZMQ based discovery is supported.
 # See a working example in scripts/install.sh
 cargo run --release -- \
-    --policy consistent_hash \
+    --policy engine_load \
     --vllm-pd-disaggregation \
     --vllm-discovery-address 0.0.0.0:30001 \
     --host 0.0.0.0 \
     --port 10001 \
-    --prefill-policy consistent_hash \
-    --decode-policy consistent_hash
+    --prefill-policy engine_load \
+    --decode-policy engine_load
 
 # When vLLM runs the Mooncake connector, pass --kv-connector mooncake.
 # The router queries each prefill node's Mooncake bootstrap server at startup
 # to learn engine_id per DP rank, and injects transfer_id / remote_bootstrap_addr /
 # remote_engine_id into each request's kv_transfer_params for P/D coordination.
 cargo run --release -- \
-    --policy consistent_hash \
+    --policy engine_load \
     --vllm-pd-disaggregation \
     --kv-connector mooncake \
     --prefill http://127.0.0.1:8081 \
@@ -208,12 +208,12 @@ The router supports multiple load balancing policies:
 |--------|-------------|------------------|----------|
 | `round_robin` | Sequential distribution across workers | No | General purpose, even distribution |
 | `random` | Uniform random selection | No | Simple deployments |
-| `consistent_hash` | Routes same session/user to same worker | Yes | Multi-turn chat, KV cache reuse |
+| `engine_load` | Actual engine running+waiting, KV tie, safe soft affinity | Yes | Every wrapper router |
 | `power_of_two` | Picks least loaded of two random workers | No | Load-sensitive workloads |
 | `cache_aware` | Optimizes for prefix cache hits | Yes | Repeated prompts, few-shot |
 
 ```bash
-# Example: Using consistent_hash with HTTP header for session affinity
+# Example: Using engine_load with HTTP header for session affinity
 curl -X POST http://router:8000/v1/chat/completions \
   -H "X-Session-ID: my-session-123" \
   -H "Content-Type: application/json" \
@@ -277,86 +277,41 @@ The continuous integration pipeline includes comprehensive testing, benchmarking
 
 This project is a fork of [SGLang Model Gateway](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway), and we would like to explicitly acknowledge and thank the original authors for their work. At this stage, our fork includes only minimal changes to preserve the existing interface and ensure compatibility with vLLM. We anticipate further divergence as we pursue the roadmap we have in mind, which is the reason for creating the fork.
 
-### Session placement for native generation
+### Shared engine-load placement
 
-Consistent hashing remains the default. Set
-`VLLM_ROUTER_SESSION_PLACEMENT=least_tokens` to place new sessions on the healthy
-worker with the fewest counted context tokens, retaining session ownership for
-prefix-cache reuse. `VLLM_ROUTER_SESSION_IDLE_SECS` controls idle load expiry
-(default 900 seconds); ownership is retained for four idle periods.
+All wrapper HTTP routers use `--policy engine_load`: training rollout, judges,
+user simulation, evaluation and public serve. The existing census publishes
+`POST /session_placement` every two seconds with
+`{"workers":[{"worker_url":"http://worker:8000@0","observed_at":123.0,"running":2,"waiting":1,"kv_usage":0.4}]}`.
+URLs include their registered DP rank. Observations must be finite, monotonic,
+no older than six seconds, and cover every healthy rank on at least90% of hosts.
+The Router adds no request-path scrape or collector. Queue load is engine
+running+waiting plus reservations made since that engine's last observation;
+KV usage breaks equal-load ties. Repeated observations cannot erase reservations.
 
-Regular HTTP routing selects the worker and acquires its session lease in one
-transaction. The lease holds ownership until the forwarded response completes,
-fails or is dropped, so concurrent native generation and abort requests retain
-the same owner across a reset. `POST /reset_session_placement` marks owners for
-re-placement on their next idle request; an in-flight request keeps its owner.
-Prompt-token counting and the byte estimate run before taking the placement
-mutex; owner selection, load updates, expiry sweep and lease acquisition remain
-one transaction. This shortens the serialized section without changing token
-counts or affinity. It does not by itself establish cold-burst acceptance or a
-production latency improvement.
+The same atomic selector serves keyed and headerless typed chat/completions and
+native generation. Typed routes pass generation/control kind explicitly, even
+when their text extraction is empty. A settled session keeps its healthy owner
+while its queue is below `VLLM_ROUTER_SPILL_FACTOR` times the pool median
+(default2). Otherwise its next generation may move to the least-loaded engine.
+Zero-load affinity is retained. `VLLM_ROUTER_SESSION_IDLE_SECS` defaults900;
+expiry starts after the last response settles. Ownership remains available to
+abort for four idle periods. Neither health loss nor reset can move an
+outstanding request, and abort never selects a replacement owner. An unavailable
+outstanding owner fails closed. Request bodies, IDs and headers are unchanged.
 
-The HTTP accept future drains ready connections without Tokio's cooperative I/O
-budget. Awaiting listener readiness still yields, and graceful shutdown waits for
-active responses. Axum's separately spawned HTTP tasks retain their normal
-cooperative budgets. This scheduling rule does not raise the socket backlog or
-establish a production cold-burst latency result.
+`POST /reset_session_placement` marks owners for re-placement on their next
+settled generation; it does not abort requests or reset model caches.
+`GET /session_placement` and authenticated census ACKs report
+`atomic_select_and_lease:true, placement:"engine_load"`. Missing census quorum
+retains known healthy owners and refuses new blind placement. Native generation
+may receive HTTP429 with `router_admission:"engine-load-v1"`,
+`never_dispatched:true`, exact request/session IDs and `retry_after_s:2` only
+when no outstanding request or control operation can be replayed. Other failures
+remain ordinary HTTP503; the paired native caller retries only the certificate
+within its original deadline.
 
-Transparent forwarding releases the incoming body bytes and parsed JSON after
-selection and request serialization, before waiting for the backend response.
-This keeps prompt arrays out of the generation wait while preserving request
-IDs in transport errors and the response lease through completion or drop.
-
-`GET /session_placement` reports `atomic_select_and_lease: true` and the effective
-`placement` (`hash`, `least_tokens` or `kv_aware`). The reset response includes the same
-metadata and `released_sessions`. Both endpoints use the router's request
-authorization. Clients enabling token placement can verify these capabilities
-before dispatching requests.
-
-`VLLM_ROUTER_SESSION_PLACEMENT=kv_aware` retains the same session owners and
-leases, but places a new session on the healthy engine with the most free KV
-tokens. The existing control-plane census publishes `POST /session_placement`
-with `workers: [{worker_url, observed_at, kv_usage, waiting, capacity_tokens}]`. URLs must
-match registered workers exactly, including their data-parallel rank suffix.
-Times are Unix seconds, usage is a finite fraction, and capacity is the native
-positive token capacity. Unknown, missing, older-than-15-second or projected
-usage at or above0.80 or nonzero engine waiting is ineligible. New prompts reserve against the existing
-counted session load atomically; a repeated observation cannot reset that
-reservation baseline. New census observations never move an existing owner.
-
-When no eligible engine can admit a new native `/verl/v1/generate` session,
-the Router returns HTTP429 with the exact `kv-capacity-v1`, `never_dispatched`
-receipt and request/session identity. This mode requires the paired native
-client: it retries only this receipt within the original request deadline,
-without an engine abort for a request proved never dispatched. Other errors
-retain ordinary abort and settlement. There is no request-path metrics scrape,
-pending-request registry or new dispatch queue. Gauges are delayed observations,
-so this placement threshold is not a guarantee against subsequent context growth.
-
-### Judge session affinity with queue spill
-
-`VLLM_ROUTER_SESSION_PLACEMENT=least_tokens_spill` is an optional judge-pool
-mode. New sessions use the existing least-context-tokens placement. An existing
-session normally keeps its owner. Only a next generation call made with no
-request in flight may move when that host's waiting requests exceed twice the
-pool's nearest-rank median. The destination is the least-token worker on a
-fresh host no busier than the median. Abort/control bodies retain the owner.
-
-`VLLM_ROUTER_SESSION_SPILL_CONFIG` accepts typed JSON, for example
-`{"waiting_ratio":2.0,"minimum_waiting":32}`. The ratio must be finite and greater
-than one. The 32-request floor avoids moving cached sessions for one queued
-request when most hosts are idle; set it to zero to use only the ratio.
-Unknown fields are rejected. Plain `hash`, `least_tokens` and `kv_aware` keep
-their existing policies and do not enable spill.
-
-The existing authenticated `POST /session_placement` accepts a queue-only
-publication, `{"workers":[{"worker_url":"http://worker:8000@0",
-"observed_at":123.0,"waiting":10}]}`, or the existing complete KV observations.
-The existing census owns publication; the Router adds no metrics scrape.
-Waiting is summed across all healthy DP workers on each host. A host requires
-all its healthy ranks, and at least 90% of healthy hosts must have observations
-no older than 15 seconds before spill is considered. Missing/stale telemetry
-preserves affinity; it does not block new least-token placement. Publications
-are validated atomically against registered workers and monotonic timestamps.
-A gateway advertising only `least_tokens` must adopt this mode and a publisher
-before enabling it; a configuration flag alone does not provide queue feedback.
+The old placement-mode environment selector and token/hash/KV-only placement
+modes are removed. Spill factor and idle timeout are shared parameters, with no
+pool-specific algorithm. Delayed gauges and CPU controls do not establish a
+production queue-tail improvement; qualify that with whole-pool observations.

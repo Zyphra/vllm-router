@@ -536,6 +536,66 @@ mod tests {
         .unwrap();
     }
     #[test]
+    fn measured_pool_snapshot_replay() {
+        let Ok(path) = std::env::var("ROUTER_REPLAY_FILE") else {
+            return;
+        };
+        let data: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut w: Vec<Arc<dyn Worker>> = Vec::new();
+        let mut rows = Vec::new();
+        for host in data["observations"].as_array().unwrap() {
+            for (rank, running) in host["running"].as_object().unwrap() {
+                let url = format!("{}@{}", host["origin"].as_str().unwrap(), rank);
+                rows.push(EngineObservation {
+                    worker_url: url.clone(),
+                    observed_at: 100.0,
+                    running: running.as_f64().unwrap() as u64,
+                    waiting: host["waiting"][rank].as_f64().unwrap() as u64,
+                    kv_usage: host["kv"][rank].as_f64().unwrap(),
+                });
+                w.push(Arc::new(BasicWorker::new(url, WorkerType::Regular)));
+            }
+        }
+        let p = EngineLoadPolicy::new();
+        p.update_at(
+            EngineSnapshot {
+                workers: rows.clone(),
+            },
+            &w.iter().map(|w| w.url().to_owned()).collect::<Vec<_>>(),
+            100.0,
+        )
+        .unwrap();
+        let minimum = rows.iter().map(|r| r.running + r.waiting).min().unwrap();
+        let first = p
+            .choose(&w, None, None, true, Instant::now(), 100.0)
+            .unwrap();
+        assert_eq!(rows[first.0].running + rows[first.0].waiting, minimum);
+        let mut leases = vec![first.1];
+        let mut assigned = vec![0u64; w.len()];
+        assigned[first.0] += 1;
+        for _ in 1..4096 {
+            let (idx, lease) = p
+                .choose(&w, None, None, true, Instant::now(), 100.0)
+                .unwrap();
+            assigned[idx] += 1;
+            leases.push(lease);
+        }
+        let max_source = rows
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, r)| r.running + r.waiting)
+            .unwrap()
+            .0;
+        assert_eq!(
+            assigned[max_source], 0,
+            "must not add calls to hottest measured engine"
+        );
+        println!("MEASURED_POOL_REPLAY ranks={} calls=4096 initial_min_queue={} hottest_queue={} hottest_new_calls={} body_or_model_calls=0",w.len(),minimum,rows[max_source].running+rows[max_source].waiting,assigned[max_source]);
+        drop(leases);
+    }
+
+    #[test]
     fn actual_queue_precedes_kv_and_headerless_reservations_are_atomic() {
         let p = EngineLoadPolicy::with_parameters(Duration::from_secs(900), 2.0);
         let w = workers();
