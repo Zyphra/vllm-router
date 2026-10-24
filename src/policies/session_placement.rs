@@ -538,10 +538,10 @@ mod tests {
             .into_iter()
             .filter_map(|handle| handle.join().unwrap())
             .collect();
-        assert_eq!(admitted.len(), 6);
-        assert_eq!(tokens_on(&placement, "a@0"), 300);
-        assert_eq!(tokens_on(&placement, "b@0"), 300);
-        assert_eq!(placement.state.lock().unwrap().sessions.len(), 6);
+        assert_eq!(admitted.len(), 4);
+        assert_eq!(tokens_on(&placement, "a@0"), 200);
+        assert_eq!(tokens_on(&placement, "b@0"), 200);
+        assert_eq!(placement.state.lock().unwrap().sessions.len(), 4);
         drop(admitted);
     }
 
@@ -586,10 +586,57 @@ mod tests {
                 placement.try_place_and_lease(&format!("s{i}"), Some(&body(100)), &["a@0", "b@0"])
             })
             .collect();
-        assert_eq!(admitted.len(), 16);
-        assert_eq!(tokens_on(&placement, "a@0"), 800);
-        assert_eq!(tokens_on(&placement, "b@0"), 800);
+        assert_eq!(admitted.len(), 14);
+        assert_eq!(tokens_on(&placement, "a@0"), 700);
+        assert_eq!(tokens_on(&placement, "b@0"), 700);
         drop(admitted);
+    }
+
+    #[test]
+    fn heterogeneous_waiting_filters_only_new_sessions() {
+        let placement = kv_placement(&[("hot@0", 0.79, 1000), ("cool@0", 0.7, 1000)]);
+        let update = || super::super::KvSnapshot {
+            workers: vec![
+                super::super::KvObservation {
+                    worker_url: "hot@0".into(),
+                    observed_at: unix_now(),
+                    kv_usage: 0.79,
+                    waiting: 22,
+                    capacity_tokens: 1000,
+                },
+                super::super::KvObservation {
+                    worker_url: "cool@0".into(),
+                    observed_at: unix_now(),
+                    kv_usage: 0.7,
+                    waiting: 0,
+                    capacity_tokens: 1000,
+                },
+            ],
+        };
+        placement
+            .update_kv_snapshot(update(), &["hot@0".into(), "cool@0".into()])
+            .unwrap();
+        let (owner, lease) = placement
+            .try_place_and_lease("resident", Some(&body(10)), &["hot@0", "cool@0"])
+            .unwrap();
+        assert_eq!(owner, "cool@0");
+        placement
+            .update_kv_snapshot(
+                super::super::KvSnapshot { workers: vec![] },
+                &["hot@0".into(), "cool@0".into()],
+            )
+            .unwrap();
+        assert!(placement
+            .try_place_and_lease("new", Some(&body(10)), &["hot@0", "cool@0"])
+            .is_none());
+        assert_eq!(
+            placement
+                .try_place_and_lease("resident", Some(&body(20)), &["hot@0", "cool@0"])
+                .unwrap()
+                .0,
+            owner
+        );
+        drop(lease);
     }
 
     fn body(tokens: usize) -> String {
