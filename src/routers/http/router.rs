@@ -2938,6 +2938,7 @@ mod tests {
             return;
         }
         use crate::server::{build_app_with_request_tracing, AppContext, AppState};
+        use std::future::IntoFuture;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let requests = std::env::var("ROUTER_FAN_IN_REQUESTS")
             .ok()
@@ -2989,7 +2990,7 @@ mod tests {
                 tokio::select! { _=crate::server::unconstrained_accept(axum::serve(listener,app))=>{}, _=router_done=>{} }
             });
         });
-        let (origin, urls) = ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let (origin, urls, metrics_port) = ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
         let report=tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async move {
             let client=Client::builder().no_proxy().timeout(Duration::from_secs(15)).pool_max_idle_per_host(concurrency).build().unwrap();
             let samples=Arc::new(std::sync::Mutex::new(Vec::<(String,f64,u16)>::new()));
