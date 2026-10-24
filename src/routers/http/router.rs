@@ -554,7 +554,11 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        let text = typed_req.extract_text_for_routing();
+        // Typed generation routes are generation requests even when native
+        // extract_text_for_routing() is empty (chat/tokenized requests). Pass
+        // their real serialized object so session history survives spill.
+        let text = serde_json::to_string(typed_req)
+            .unwrap_or_else(|_| typed_req.extract_text_for_routing());
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,

@@ -59,11 +59,13 @@ pub struct SessionLease {
     state: Arc<Mutex<State>>,
     key: Option<String>,
     worker: String,
+    worker_handle: Arc<dyn Worker>,
     epoch: u64,
 }
 
 impl Drop for SessionLease {
     fn drop(&mut self) {
+        self.worker_handle.decrement_load();
         let mut state = self.state.lock().unwrap();
         if let Some(reading) = state.readings.get_mut(&self.worker) {
             if reading.epoch == self.epoch {
@@ -358,10 +360,14 @@ impl EngineLoadPolicy {
         workers[idx].increment_processed();
         RouterMetrics::record_processed_request(&worker);
         RouterMetrics::record_policy_decision(self.name(), &worker);
+        if reserve {
+            workers[idx].increment_load();
+        }
         let lease = reserve.then(|| SessionLease {
             state: Arc::clone(&self.state),
             key,
             worker,
+            worker_handle: Arc::clone(&workers[idx]),
             epoch,
         });
         Some((idx, lease))
