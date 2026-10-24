@@ -296,7 +296,11 @@ while its queue is below `VLLM_ROUTER_SPILL_FACTOR` times the pool median
 (default2). Otherwise its next generation may move to the least-loaded engine.
 Zero-load affinity is retained. `VLLM_ROUTER_SESSION_IDLE_SECS` defaults900;
 expiry starts after the last response settles. Ownership remains available to
-abort for four idle periods. Neither health loss nor reset can move an
+abort for four idle periods. Addressed settled owners expire on each request;
+the full expired-session sweep runs at most once per `min(idle,30s)`. Engine
+host identities are cached, and metrics recording runs outside the placement
+lock. These reduce retained-session cost without changing affinity or abort
+ownership. Neither health loss nor reset can move an
 outstanding request, and abort never selects a replacement owner. An unavailable
 outstanding owner fails closed. Request bodies, IDs and headers are unchanged.
 
