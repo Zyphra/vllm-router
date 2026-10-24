@@ -148,7 +148,7 @@ impl EngineLoadPolicy {
         let mut state = self.state.lock().unwrap();
         for i in 0..count {
             state.sessions.insert(
-                format!("settled-{i}"),
+                format!("header:x-session-id:settled-{i}"),
                 Session {
                     worker: workers[i % workers.len()].url().to_owned(),
                     inflight: 0,
