@@ -48,6 +48,7 @@ struct Session {
 #[derive(Debug, Default)]
 struct State {
     readings: HashMap<String, Reading>,
+    watermarks: HashMap<String, EngineObservation>,
     sessions: HashMap<String, Session>,
     epoch: u64,
     sequence: u64,
@@ -190,13 +191,17 @@ impl EngineLoadPolicy {
             {
                 return Err("invalid, duplicate, stale or unregistered engine observation".into());
             }
-            if let Some(old) = state.readings.get(&row.worker_url) {
-                if row.observed_at < old.observation.observed_at
-                    || (row.observed_at == old.observation.observed_at && *row != old.observation)
+            if let Some(old) = state.watermarks.get(&row.worker_url) {
+                if row.observed_at < old.observed_at
+                    || (row.observed_at == old.observed_at && *row != *old)
                 {
                     return Err("engine observation moved backwards or conflicts".into());
                 }
             }
+        }
+        state.watermarks.retain(|url, _| registered.contains(url));
+        for row in &snapshot.workers {
+            state.watermarks.insert(row.worker_url.clone(), row.clone());
         }
         let mut next = HashMap::new();
         for row in snapshot.workers {
@@ -275,7 +280,9 @@ impl EngineLoadPolicy {
         // abort. Returning no route is safer than aborting an unrelated engine.
         if resident.is_some_and(|s| s.inflight > 0) || abort {
             let idx = owner?;
-            return self.reserve_locked(&mut state, workers, idx, key, reserve, !abort, instant);
+            return self.reserve_locked(
+                &mut state, workers, idx, key, reserve, !abort, false, instant,
+            );
         }
 
         let mut hosts: HashMap<String, (usize, usize)> = HashMap::new();
@@ -309,7 +316,8 @@ impl EngineLoadPolicy {
             // Missing feedback cannot introduce a new blind placement. Existing
             // sessions retain their known owner until fresh feedback returns.
             let idx = owner?;
-            return self.reserve_locked(&mut state, workers, idx, key, reserve, true, instant);
+            return self
+                .reserve_locked(&mut state, workers, idx, key, reserve, true, false, instant);
         }
         fresh.retain(|(idx, _, _, _)| complete.contains(&host(workers[*idx].url())));
         if fresh.is_empty() {
@@ -339,7 +347,7 @@ impl EngineLoadPolicy {
                 .unwrap()
                 .0
         };
-        self.reserve_locked(&mut state, workers, idx, key, reserve, true, instant)
+        self.reserve_locked(&mut state, workers, idx, key, reserve, true, true, instant)
     }
 
     fn reserve_locked(
@@ -350,6 +358,7 @@ impl EngineLoadPolicy {
         key: Option<String>,
         reserve: bool,
         inference: bool,
+        placement_selected: bool,
         instant: Instant,
     ) -> Option<(usize, Option<SessionLease>)> {
         let worker = workers[idx].url().to_owned();
@@ -380,7 +389,9 @@ impl EngineLoadPolicy {
                 "cannot move an outstanding session"
             );
             session.worker = worker.clone();
-            session.released = false;
+            if placement_selected {
+                session.released = false;
+            }
             if reserve {
                 session.inflight += 1;
             }
@@ -409,8 +420,16 @@ impl LoadBalancingPolicy for EngineLoadPolicy {
         text: Option<&str>,
         headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
-        self.choose(workers, text, headers, false, Instant::now(), wall_time())
-            .map(|x| x.0)
+        self.choose_kind(
+            workers,
+            text,
+            headers,
+            false,
+            Instant::now(),
+            wall_time(),
+            false,
+        )
+        .map(|x| x.0)
     }
     fn select_worker_with_lease(
         &self,
@@ -418,7 +437,15 @@ impl LoadBalancingPolicy for EngineLoadPolicy {
         text: Option<&str>,
         headers: Option<&RequestHeaders>,
     ) -> Option<(usize, Option<SessionLease>)> {
-        self.choose(workers, text, headers, true, Instant::now(), wall_time())
+        self.choose_kind(
+            workers,
+            text,
+            headers,
+            true,
+            Instant::now(),
+            wall_time(),
+            false,
+        )
     }
     fn select_generation_worker_with_lease(
         &self,
@@ -535,6 +562,106 @@ mod tests {
         )
         .unwrap();
     }
+    #[test]
+    fn reset_release_survives_overlap_abort_and_stale_retention() {
+        let p = EngineLoadPolicy::new();
+        let w = workers();
+        let h = headers();
+        publish(&p, &w, &[0, 0], &[0.2, 0.2], 100.0);
+        let first = p
+            .choose(
+                &w,
+                Some("generation"),
+                Some(&h),
+                true,
+                Instant::now(),
+                100.0,
+            )
+            .unwrap();
+        p.release_session_owners();
+        let overlap = p
+            .choose(
+                &w,
+                Some("generation"),
+                Some(&h),
+                true,
+                Instant::now(),
+                100.0,
+            )
+            .unwrap();
+        assert_eq!(overlap.0, first.0);
+        drop(overlap);
+        let abort = p
+            .choose(
+                &w,
+                Some(r#"{"request_ids":["r"]}"#),
+                Some(&h),
+                true,
+                Instant::now(),
+                100.0,
+            )
+            .unwrap();
+        drop(abort);
+        assert!(p
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .all(|s| s.released));
+        let original = first.0;
+        drop(first);
+        let retained = p
+            .choose(
+                &w,
+                Some("generation"),
+                Some(&h),
+                true,
+                Instant::now(),
+                110.0,
+            )
+            .unwrap();
+        drop(retained);
+        assert!(p
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .all(|s| s.released));
+        publish(&p, &w, &[0, 0], &[0.2, 0.2], 111.0);
+        let next = p
+            .choose(
+                &w,
+                Some("generation"),
+                Some(&h),
+                true,
+                Instant::now(),
+                111.0,
+            )
+            .unwrap();
+        assert_ne!(next.0, original);
+    }
+    #[test]
+    fn omitted_observation_cannot_erase_monotonic_watermark() {
+        let p = EngineLoadPolicy::new();
+        let w = workers();
+        publish(&p, &w, &[0, 0], &[0.2, 0.2], 100.0);
+        let registered = w.iter().map(|w| w.url().to_owned()).collect::<Vec<_>>();
+        p.update_at(EngineSnapshot { workers: vec![] }, &registered, 101.0)
+            .unwrap();
+        let row = EngineObservation {
+            worker_url: w[0].url().to_owned(),
+            observed_at: 99.0,
+            running: 0,
+            waiting: 0,
+            kv_usage: 0.2,
+        };
+        assert!(p
+            .update_at(EngineSnapshot { workers: vec![row] }, &registered, 101.0)
+            .is_err());
+    }
+
     #[test]
     fn measured_pool_snapshot_replay() {
         let Ok(path) = std::env::var("ROUTER_REPLAY_FILE") else {
