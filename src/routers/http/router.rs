@@ -2929,7 +2929,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_chat_spills_settled_owner_and_fails_closed_while_outstanding() {
-        use crate::app_context::AppContext;
+        use crate::server::AppContext;
         use crate::server::{build_app_with_request_tracing, AppState};
         use tower::ServiceExt;
         let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
