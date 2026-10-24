@@ -2929,6 +2929,124 @@ mod tests {
         }
     }
 
+    /// Opt-in, allocated-CPU production-size latency probe. The backend and
+    /// load generator have independent runtimes so a blocked Router cannot
+    /// prevent its client-side timeout/latency measurement from advancing.
+    #[test]
+    fn production_fan_in_control_plane_probe() {
+        if std::env::var("ROUTER_FAN_IN_PROBE").as_deref() != Ok("1") {
+            return;
+        }
+        use crate::server::{build_app_with_request_tracing, AppContext, AppState};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let requests = std::env::var("ROUTER_FAN_IN_REQUESTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8192);
+        let concurrency = std::env::var("ROUTER_FAN_IN_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512);
+        let backend = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        backend.set_nonblocking(true).unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        let (backend_stop, backend_done) = tokio::sync::oneshot::channel::<()>();
+        let backend_thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async move {
+                let app=axum::Router::new().fallback(axum::routing::any(|req:Request| async move {
+                    if req.uri().path()=="/metrics" {
+                        return (StatusCode::OK,"vllm:num_requests_running{engine=\"0\"} 0\nvllm:num_requests_waiting{engine=\"0\"} 0\n").into_response();
+                    }
+                    Json(serde_json::json!({"id":"probe","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"output_ids":[1],"request_id":"probe"})).into_response()
+                }));
+                let listener=tokio::net::TcpListener::from_std(backend).unwrap();
+                tokio::select! { _=axum::serve(listener,app).into_future()=>{}, _=backend_done=>{} }
+            });
+        });
+        let (router_stop, router_done) = tokio::sync::oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let router_thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread().worker_threads(8).enable_all().build().unwrap().block_on(async move {
+                let policy=Arc::new(crate::policies::EngineLoadPolicy::new());
+                let mut router=create_test_regular_router();
+                router.client=Client::builder().no_proxy().build().unwrap();
+                router.retry_config.max_retries=0; router.intra_node_data_parallel_size=8;
+                router.worker_registry=Arc::new(WorkerRegistry::new());
+                for h in 1..=72 { for rank in 0..8 {
+                    router.worker_registry.register(Arc::new(DPAwareWorker::new(format!("http://127.0.{h}.1:{backend_port}"),rank,8,WorkerType::Regular)));
+                }}
+                let workers=router.worker_registry.get_all(); assert_eq!(workers.len(),576);
+                policy.seed_probe_sessions(100_000,&workers);
+                let p:Arc<dyn LoadBalancingPolicy>=policy;
+                router.policy_registry=Arc::new(PolicyRegistry::with_default_policy(p));
+                seed_engine_load(&router);
+                let urls=router.get_worker_urls(); let router=Arc::new(router);
+                let context=Arc::new(AppContext::new(crate::config::RouterConfig::default(),Client::new(),10000,None,vec![]).unwrap());
+                let state=Arc::new(AppState{router,context,concurrency_queue_tx:None,router_manager:None});
+                let app=build_app_with_request_tracing(state,16*1024*1024,vec![],vec![],true,false);
+                let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                ready_tx.send((format!("http://{}",listener.local_addr().unwrap()),urls)).unwrap();
+                tokio::select! { _=crate::server::unconstrained_accept(axum::serve(listener,app))=>{}, _=router_done=>{} }
+            });
+        });
+        let (origin, urls) = ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let report=tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async move {
+            let client=Client::builder().no_proxy().timeout(Duration::from_secs(15)).pool_max_idle_per_host(concurrency).build().unwrap();
+            let samples=Arc::new(std::sync::Mutex::new(Vec::<(String,f64,u16)>::new()));
+            let done=Arc::new(AtomicBool::new(false)); let next=Arc::new(AtomicUsize::new(0));
+            let start=Instant::now(); let mut controls=Vec::new();
+            for kind in ["control_get","workers_get","snapshot_post","metrics_get"] {
+                let client=client.clone();let origin=origin.clone();let urls=urls.clone();let samples=samples.clone();let done=done.clone();
+                controls.push(tokio::spawn(async move {
+                    let mut n=0;
+                    while !done.load(Ordering::Relaxed) || n<8 {
+                        let began=Instant::now();
+                        let req=match kind {
+                            "control_get"=>client.get(format!("{origin}/session_placement")),
+                            "workers_get"=>client.get(format!("{origin}/list_workers")),
+                            "metrics_get"=>client.get(format!("http://127.0.{}.1:{backend_port}/metrics",n%72+1)),
+                            _=>{
+                                let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+                                client.post(format!("{origin}/session_placement")).json(&serde_json::json!({"workers":urls.iter().map(|u|serde_json::json!({"worker_url":u,"observed_at":now,"running":0,"waiting":0,"kv_usage":0.1})).collect::<Vec<_>>()}))
+                            }
+                        };
+                        let status=match req.send().await {Ok(r)=>{let status=r.status().as_u16();let _=r.bytes().await;status},Err(_)=>0};
+                        samples.lock().unwrap().push((kind.into(),began.elapsed().as_secs_f64()*1000.0,status));
+                        n+=1;tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }));
+            }
+            let mut tasks=tokio::task::JoinSet::new();
+            for _ in 0..concurrency {
+                let client=client.clone();let origin=origin.clone();let samples=samples.clone();let next=next.clone();
+                tasks.spawn(async move {loop {
+                    let i=next.fetch_add(1,Ordering::Relaxed);if i>=requests {break;}
+                    let (kind,path,body)=if i%2==0 {("typed_generation","/v1/chat/completions",serde_json::json!({"model":"m","messages":[{"role":"user","content":"preserve session history"}],"stream":false}))}
+                    else {("native_generation","/verl/v1/generate",serde_json::json!({"request_id":format!("probe-{i}"),"prompt_ids":vec![1;1024],"sampling_params":{"max_tokens":1}}))};
+                    let began=Instant::now();
+                    let status=match client.post(format!("{origin}{path}")).header("X-Session-ID",format!("settled-{}",i%100_000)).json(&body).send().await {Ok(r)=>{let status=r.status().as_u16();let _=r.bytes().await;status},Err(_)=>0};
+                    samples.lock().unwrap().push((kind.into(),began.elapsed().as_secs_f64()*1000.0,status));
+                }});
+            }
+            while let Some(result)=tasks.join_next().await {result.unwrap();}
+            let generation_s=start.elapsed().as_secs_f64();done.store(true,Ordering::Relaxed);
+            for task in controls {task.await.unwrap();}
+            let mut rows=serde_json::Map::new();
+            for kind in ["typed_generation","native_generation","control_get","workers_get","snapshot_post","metrics_get"] {
+                let guard=samples.lock().unwrap();let mut values=guard.iter().filter(|r|r.0==kind).map(|r|r.1).collect::<Vec<_>>();values.sort_by(f64::total_cmp);
+                let percentile=|q:f64| {let x=q*(values.len()-1)as f64;let i=x.floor()as usize;values[i]+(values[(i+1).min(values.len()-1)]-values[i])*(x-i as f64)};
+                let errors=guard.iter().filter(|r|r.0==kind && r.2!=200).count();
+                rows.insert(kind.into(),serde_json::json!({"samples":values.len(),"errors_or_timeouts":errors,"p50_ms":percentile(0.5),"p90_ms":percentile(0.9),"p99_ms":percentile(0.99),"max_ms":values.last()}));
+            }
+            serde_json::json!({"sessions":100_000,"engines":576,"hosts":72,"router_threads":8,"generator_threads":2,"backend_threads":2,"requests":requests,"concurrency":concurrency,"generation_s":generation_s,"generation_requests_per_s":requests as f64/generation_s,"measurements":rows,"scope":"Synthetic queues and mocked backend; actual native Router HTTP typed/native/control paths. No GPU, model call, serving latency or production stall-cause claim."})
+        });
+        println!("PRODUCTION_FAN_IN_PROBE={report}");
+        let _ = router_stop.send(());
+        let _ = backend_stop.send(());
+        router_thread.join().unwrap();
+        backend_thread.join().unwrap();
+    }
+
     #[tokio::test]
     async fn public_chat_spills_settled_owner_and_fails_closed_while_outstanding() {
         use crate::server::AppContext;

@@ -140,6 +140,23 @@ impl EngineLoadPolicy {
             reading.observation.observed_at = wall_time();
         }
     }
+    #[cfg(test)]
+    pub(crate) fn seed_probe_sessions(&self, count: usize, workers: &[Arc<dyn Worker>]) {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        for i in 0..count {
+            state.sessions.insert(
+                format!("settled-{i}"),
+                Session {
+                    worker: workers[i % workers.len()].url().to_owned(),
+                    inflight: 0,
+                    last_settled: now,
+                    released: false,
+                },
+            );
+        }
+    }
+
     pub fn new() -> Self {
         let idle = std::env::var("VLLM_ROUTER_SESSION_IDLE_SECS")
             .ok()
