@@ -23,6 +23,9 @@
 //! abort-shaped body neither moves nor shrinks a session.
 
 use super::kv_capacity::{KvCapacity, KvSnapshot};
+use super::session_spill::{
+    host, QueueObservation, QueuePressure, QueueSnapshot, SessionSpillConfig, SPILL_CONFIG_ENV,
+};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -59,6 +62,7 @@ struct State {
     loads: HashMap<String, Load>,
     last_sweep: Instant,
     capacity: KvCapacity,
+    queue: QueuePressure,
 }
 
 impl State {
@@ -109,6 +113,7 @@ impl Drop for SessionLease {
 pub struct TokenPlacement {
     idle: Duration,
     kv_aware: bool,
+    spill: Option<SessionSpillConfig>,
     state: Mutex<State>,
 }
 
@@ -117,11 +122,13 @@ impl TokenPlacement {
         Self {
             idle,
             kv_aware: false,
+            spill: None,
             state: Mutex::new(State {
                 sessions: HashMap::new(),
                 loads: HashMap::new(),
                 last_sweep: Instant::now(),
                 capacity: KvCapacity::default(),
+                queue: QueuePressure::default(),
             }),
         }
     }
@@ -131,11 +138,29 @@ impl TokenPlacement {
         self
     }
 
+    pub fn with_queue_spill(mut self, config: SessionSpillConfig) -> Result<Self, String> {
+        config.validate()?;
+        self.spill = Some(config);
+        Ok(self)
+    }
+
+    fn generation_request(&self, request_text: Option<&str>, exact: Option<u64>) -> bool {
+        self.spill.is_some()
+            && (exact.is_some()
+                || request_text
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                    .is_some_and(|body| {
+                        body.get("messages").is_some()
+                            || body.get("prompt").is_some()
+                            || body.get("input").is_some()
+                    }))
+    }
+
     /// Build from the environment; `None` keeps plain consistent hashing.
     pub fn from_env() -> Option<Self> {
         match std::env::var(PLACEMENT_ENV).ok().as_deref() {
             None | Some("") | Some("hash") => None,
-            Some(mode @ ("least_tokens" | "kv_aware")) => {
+            Some(mode @ ("least_tokens" | "kv_aware" | "least_tokens_spill")) => {
                 let idle = match std::env::var(IDLE_SECS_ENV).ok().as_deref() {
                     None | Some("") => DEFAULT_IDLE_SECS,
                     Some(value) => match value.parse::<u64>() {
@@ -146,6 +171,18 @@ impl TokenPlacement {
                 let placement = Self::new(Duration::from_secs(idle));
                 let placement = if mode == "kv_aware" {
                     placement.with_kv_capacity()
+                } else if mode == "least_tokens_spill" {
+                    let config = std::env::var(SPILL_CONFIG_ENV)
+                        .ok()
+                        .filter(|text| !text.is_empty())
+                        .map(|text| {
+                            serde_json::from_str::<SessionSpillConfig>(&text)
+                                .expect("invalid session spill config")
+                        })
+                        .unwrap_or_default();
+                    placement
+                        .with_queue_spill(config)
+                        .expect("invalid session spill config")
                 } else {
                     placement
                 };
@@ -153,7 +190,7 @@ impl TokenPlacement {
             }
             Some(other) => {
                 panic!(
-                    "{PLACEMENT_ENV} must be 'hash', 'least_tokens' or 'kv_aware', got {other:?}"
+                    "{PLACEMENT_ENV} must be 'hash', 'least_tokens', 'kv_aware' or 'least_tokens_spill', got {other:?}"
                 )
             }
         }
@@ -176,8 +213,15 @@ impl TokenPlacement {
     ) -> Option<String> {
         let tokens = prompt_token_count(request_text);
         let estimate = request_text.map_or(0, |text| text.len() as u64 / 4);
+        let generation = self.generation_request(request_text, tokens);
         let mut state = self.state.lock().unwrap();
-        self.place_locked(&mut state, key, (tokens, estimate), healthy, Instant::now())
+        self.place_locked(
+            &mut state,
+            key,
+            (tokens, estimate, generation),
+            healthy,
+            Instant::now(),
+        )
     }
 
     fn place_at(
@@ -189,9 +233,16 @@ impl TokenPlacement {
     ) -> String {
         let tokens = prompt_token_count(request_text);
         let estimate = request_text.map_or(0, |text| text.len() as u64 / 4);
+        let generation = self.generation_request(request_text, tokens);
         let mut state = self.state.lock().unwrap();
-        self.place_locked(&mut state, key, (tokens, estimate), healthy, now)
-            .expect("no fresh KV capacity for session placement")
+        self.place_locked(
+            &mut state,
+            key,
+            (tokens, estimate, generation),
+            healthy,
+            now,
+        )
+        .expect("no fresh KV capacity for session placement")
     }
 
     /// Select and reserve the owner in one transaction. Hold the returned lease
@@ -217,8 +268,15 @@ impl TokenPlacement {
         // behind a long prompt while occupying the async runtime's workers.
         let tokens = prompt_token_count(request_text);
         let estimate = request_text.map_or(0, |text| text.len() as u64 / 4);
+        let generation = self.generation_request(request_text, tokens);
         let mut state = self.state.lock().unwrap();
-        let worker = self.place_locked(&mut state, key, (tokens, estimate), healthy, now)?;
+        let worker = self.place_locked(
+            &mut state,
+            key,
+            (tokens, estimate, generation),
+            healthy,
+            now,
+        )?;
         state.sessions.get_mut(key).unwrap().inflight += 1;
         let lease = SessionLease::Session {
             placement: Arc::clone(self),
@@ -231,18 +289,33 @@ impl TokenPlacement {
         &self,
         state: &mut State,
         key: &str,
-        context: (Option<u64>, u64),
+        context: (Option<u64>, u64, bool),
         healthy: &[&str],
         now: Instant,
     ) -> Option<String> {
-        let (exact, estimate) = context;
+        let (exact, estimate, generation) = context;
         self.sweep(state, now);
 
         let owner_gone = state.sessions.get(key).is_some_and(|session| {
             !healthy.contains(&session.worker.as_str())
                 || (session.released && session.inflight == 0)
         });
-        let new_owner = owner_gone || !state.sessions.contains_key(key);
+        let spill_hosts = if generation {
+            state
+                .sessions
+                .get(key)
+                .filter(|session| session.inflight == 0)
+                .and_then(|session| {
+                    self.spill.as_ref().and_then(|config| {
+                        state
+                            .queue
+                            .spill_hosts(&session.worker, healthy, config, unix_now())
+                    })
+                })
+        } else {
+            None
+        };
+        let new_owner = owner_gone || !state.sessions.contains_key(key) || spill_hosts.is_some();
         let previous_tokens = state.sessions.get(key).map_or(0, |session| session.tokens);
         if new_owner {
             // Re-placing an existing session keeps its in-flight count, so its
@@ -276,6 +349,11 @@ impl TokenPlacement {
             } else {
                 healthy
                     .iter()
+                    .filter(|worker| {
+                        spill_hosts
+                            .as_ref()
+                            .map_or(true, |hosts| hosts.contains(&host(worker)))
+                    })
                     .min_by_key(|worker| state.loads.get(**worker).copied().unwrap_or_default())?
                     .to_string()
             };
@@ -304,9 +382,26 @@ impl TokenPlacement {
     pub fn mode(&self) -> &'static str {
         if self.kv_aware {
             "kv_aware"
+        } else if self.spill.is_some() {
+            "least_tokens_spill"
         } else {
             "least_tokens"
         }
+    }
+
+    pub fn update_queue_snapshot(
+        &self,
+        snapshot: QueueSnapshot,
+        registered: &[String],
+    ) -> Result<usize, String> {
+        if self.spill.is_none() {
+            return Err("queue spill placement is disabled".into());
+        }
+        self.state
+            .lock()
+            .unwrap()
+            .queue
+            .update(snapshot, registered, unix_now())
     }
 
     pub fn update_kv_snapshot(
@@ -314,6 +409,22 @@ impl TokenPlacement {
         snapshot: KvSnapshot,
         registered: &[String],
     ) -> Result<usize, String> {
+        if self.spill.is_some() {
+            return self.update_queue_snapshot(
+                QueueSnapshot {
+                    workers: snapshot
+                        .workers
+                        .into_iter()
+                        .map(|row| QueueObservation {
+                            worker_url: row.worker_url,
+                            observed_at: row.observed_at,
+                            waiting: row.waiting,
+                        })
+                        .collect(),
+                },
+                registered,
+            );
+        }
         if !self.kv_aware {
             return Err("KV updates require kv_aware session placement".into());
         }
@@ -637,6 +748,136 @@ mod tests {
             owner
         );
         drop(lease);
+    }
+
+    fn queue_publish(placement: &TokenPlacement, waiting: &[(&str, u64)]) {
+        placement
+            .update_queue_snapshot(
+                QueueSnapshot {
+                    workers: waiting
+                        .iter()
+                        .map(|(worker, waiting)| QueueObservation {
+                            worker_url: worker.to_string(),
+                            observed_at: unix_now(),
+                            waiting: *waiting,
+                        })
+                        .collect(),
+                },
+                &waiting
+                    .iter()
+                    .map(|(worker, _)| worker.to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn judge_spill_moves_only_idle_generation_and_conserves_counted_load() {
+        let placement = Arc::new(
+            TokenPlacement::new(Duration::from_secs(900))
+                .with_queue_spill(SessionSpillConfig::default())
+                .unwrap(),
+        );
+        let workers = ["http://hot:1@0", "http://cool:2@0", "http://middle:3@0"];
+        let (owner, lease) = placement
+            .try_place_and_lease("s", Some(&body(100)), &workers)
+            .unwrap();
+        assert_eq!(owner, workers[0]);
+        queue_publish(
+            &placement,
+            &[(workers[0], 1200), (workers[1], 10), (workers[2], 100)],
+        );
+        // Concurrent/abort routes cannot move a physical request's owner.
+        let (same, concurrent) = placement
+            .try_place_and_lease("s", Some(&body(110)), &workers)
+            .unwrap();
+        assert_eq!(same, owner);
+        drop(concurrent);
+        drop(lease);
+        assert_eq!(
+            placement
+                .try_place("s", Some("{\"request_id\":\"r\"}"), &workers)
+                .unwrap(),
+            owner
+        );
+        let (moved, lease) = placement
+            .try_place_and_lease("s", Some(&body(120)), &workers)
+            .unwrap();
+        assert_eq!(moved, workers[1]);
+        assert_eq!(tokens_on(&placement, workers[0]), 0);
+        assert_eq!(tokens_on(&placement, workers[1]), 120);
+        drop(lease);
+        // Unqueued resident affinity survives later requests.
+        let (same, _) = placement
+            .try_place_and_lease("s", Some(&body(130)), &workers)
+            .unwrap();
+        assert_eq!(same, moved);
+    }
+
+    #[test]
+    fn judge_spill_unknown_or_stale_queue_preserves_affinity_and_new_sessions_use_least_tokens() {
+        let placement = Arc::new(
+            TokenPlacement::new(Duration::from_secs(900))
+                .with_queue_spill(SessionSpillConfig::default())
+                .unwrap(),
+        );
+        let workers = ["a", "b", "c"];
+        let (owner, lease) = placement
+            .try_place_and_lease("s", Some(&body(100)), &workers)
+            .unwrap();
+        drop(lease);
+        assert_eq!(owner, "a");
+        queue_publish(&placement, &[("a", 30), ("b", 0), ("c", 0)]);
+        assert_eq!(
+            placement
+                .try_place("s", Some(&body(101)), &workers)
+                .unwrap(),
+            owner
+        ); // floor32 avoids jitter
+        queue_publish(&placement, &[("a", 1000), ("b", 0), ("c", 0)]);
+        placement.state.lock().unwrap().queue = QueuePressure::default();
+        assert_eq!(
+            placement
+                .try_place("s", Some(&body(102)), &workers)
+                .unwrap(),
+            owner
+        );
+        let (new, _) = placement
+            .try_place_and_lease("new", Some(&body(10)), &workers)
+            .unwrap();
+        assert_eq!(new, "b");
+        assert!(TokenPlacement::new(Duration::from_secs(900))
+            .update_queue_snapshot(QueueSnapshot { workers: vec![] }, &[])
+            .is_err());
+    }
+
+    #[test]
+    fn judge_chat_messages_are_work_but_abort_bodies_are_not() {
+        let placement = Arc::new(
+            TokenPlacement::new(Duration::from_secs(900))
+                .with_queue_spill(SessionSpillConfig {
+                    minimum_waiting: 0,
+                    ..SessionSpillConfig::default()
+                })
+                .unwrap(),
+        );
+        let workers = ["a", "b", "c"];
+        let chat = "{\"messages\":[{\"role\":\"user\",\"content\":\"judge\"}]}";
+        let (owner, lease) = placement
+            .try_place_and_lease("s", Some(chat), &workers)
+            .unwrap();
+        drop(lease);
+        queue_publish(&placement, &[("a", 1000), ("b", 0), ("c", 0)]);
+        assert_eq!(
+            placement
+                .try_place("s", Some("{\"request_id\":\"r\"}"), &workers)
+                .unwrap(),
+            owner
+        );
+        assert_ne!(
+            placement.try_place("s", Some(chat), &workers).unwrap(),
+            owner
+        );
     }
 
     fn body(tokens: usize) -> String {

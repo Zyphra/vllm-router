@@ -1659,6 +1659,14 @@ impl RouterTrait for Router {
         }
     }
 
+    fn update_session_queue(&self, snapshot: crate::policies::QueueSnapshot) -> Response {
+        let policy = self.policy_registry.get_default_policy();
+        match policy.update_queue_snapshot(snapshot, &self.get_worker_urls()) {
+            Ok(count) => Json(serde_json::json!({"atomic_select_and_lease":true,"placement":policy.session_placement(),"accepted_workers":count})).into_response(),
+            Err(message) => (StatusCode::BAD_REQUEST,message).into_response(),
+        }
+    }
+
     async fn get_worker_loads(&self) -> Response {
         let urls = self.get_worker_urls();
         let mut loads = Vec::new();
@@ -2398,7 +2406,19 @@ mod tests {
         tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
         tokio::task::JoinHandle<()>,
     ) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        placement_backend_on("127.0.0.1").await
+    }
+
+    async fn placement_backend_on(
+        host: &str,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind(format!("{host}:0"))
+            .await
+            .unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let rx = Arc::new(tokio::sync::Mutex::new(Some(rx)));
@@ -2434,6 +2454,109 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (url, tx, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn judge_router_spills_next_call_after_settlement_but_keeps_abort_and_stream_owner() {
+        use crate::policies::{QueueObservation, QueueSnapshot, SessionSpillConfig};
+        let mut backends = vec![
+            placement_backend_on("127.0.0.1").await,
+            placement_backend_on("127.0.0.2").await,
+            placement_backend_on("127.0.0.3").await,
+        ];
+        let policy: Arc<dyn LoadBalancingPolicy> =
+            Arc::new(crate::policies::ConsistentHashPolicy::with_placement(Some(
+                crate::policies::TokenPlacement::new(Duration::from_secs(900))
+                    .with_queue_spill(SessionSpillConfig::default())
+                    .unwrap(),
+            )));
+        let mut router = create_test_regular_router();
+        router.client = Client::builder().no_proxy().build().unwrap();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, _, _) in &backends {
+            router
+                .worker_registry
+                .register(Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular)));
+        }
+        router.policy_registry = Arc::new(PolicyRegistry::with_default_policy(policy));
+        let headers = placement_headers();
+        let request = serde_json::json!({"prompt_ids":[1,2],"request_id":"judge"});
+        let generation = router
+            .route_transparent(
+                Some(&headers),
+                "/native_generate",
+                &Method::POST,
+                request.clone(),
+            )
+            .await;
+        assert_eq!(generation.status(), StatusCode::OK);
+        let abort = serde_json::json!({"request_id":"judge"});
+        let owner = response_text(
+            router
+                .route_transparent(Some(&headers), "/abort", &Method::POST, abort.clone())
+                .await,
+        )
+        .await;
+        let snapshot = QueueSnapshot {
+            workers: backends
+                .iter()
+                .map(|(url, _, _)| QueueObservation {
+                    worker_url: url.clone(),
+                    observed_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs_f64(),
+                    waiting: if *url == owner { 1200 } else { 20 },
+                })
+                .collect(),
+        };
+        assert_eq!(
+            router.update_session_queue(snapshot).status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            response_text(
+                router
+                    .route_transparent(Some(&headers), "/abort", &Method::POST, abort.clone())
+                    .await
+            )
+            .await,
+            owner
+        );
+        let index = backends
+            .iter()
+            .position(|(url, _, _)| *url == owner)
+            .unwrap();
+        let (_, sender, owner_task) = backends.remove(index);
+        drop(sender);
+        let _ = response_text(generation).await;
+        // An idle abort still addresses the original host; only a fresh generation may spill.
+        assert_eq!(
+            response_text(
+                router
+                    .route_transparent(Some(&headers), "/abort", &Method::POST, abort.clone())
+                    .await
+            )
+            .await,
+            owner
+        );
+        let next = router
+            .route_transparent(Some(&headers), "/native_generate", &Method::POST, request)
+            .await;
+        assert_eq!(next.status(), StatusCode::OK);
+        let moved = response_text(
+            router
+                .route_transparent(Some(&headers), "/abort", &Method::POST, abort)
+                .await,
+        )
+        .await;
+        assert_ne!(moved, owner);
+        for (_, sender, task) in backends {
+            drop(sender);
+            task.abort();
+        }
+        drop(next);
+        owner_task.abort();
     }
 
     async fn placement_fixture() -> (

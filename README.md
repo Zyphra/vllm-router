@@ -332,3 +332,31 @@ without an engine abort for a request proved never dispatched. Other errors
 retain ordinary abort and settlement. There is no request-path metrics scrape,
 pending-request registry or new dispatch queue. Gauges are delayed observations,
 so this placement threshold is not a guarantee against subsequent context growth.
+
+### Judge session affinity with queue spill
+
+`VLLM_ROUTER_SESSION_PLACEMENT=least_tokens_spill` is an optional judge-pool
+mode. New sessions use the existing least-context-tokens placement. An existing
+session normally keeps its owner. Only a next generation call made with no
+request in flight may move when that host's waiting requests exceed twice the
+pool's nearest-rank median. The destination is the least-token worker on a
+fresh host no busier than the median. Abort/control bodies retain the owner.
+
+`VLLM_ROUTER_SESSION_SPILL_CONFIG` accepts typed JSON, for example
+`{"waiting_ratio":2.0,"minimum_waiting":32}`. The ratio must be finite and greater
+than one. The 32-request floor avoids moving cached sessions for one queued
+request when most hosts are idle; set it to zero to use only the ratio.
+Unknown fields are rejected. Plain `hash`, `least_tokens` and `kv_aware` keep
+their existing policies and do not enable spill.
+
+The existing authenticated `POST /session_placement` accepts a queue-only
+publication, `{"workers":[{"worker_url":"http://worker:8000@0",
+"observed_at":123.0,"waiting":10}]}`, or the existing complete KV observations.
+The existing census owns publication; the Router adds no metrics scrape.
+Waiting is summed across all healthy DP workers on each host. A host requires
+all its healthy ranks, and at least 90% of healthy hosts must have observations
+no older than 15 seconds before spill is considered. Missing/stale telemetry
+preserves affinity; it does not block new least-token placement. Publications
+are validated atomically against registered workers and monotonic timestamps.
+A gateway advertising only `least_tokens` must adopt this mode and a publisher
+before enabling it; a configuration flag alone does not provide queue feedback.

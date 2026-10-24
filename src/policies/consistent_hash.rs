@@ -565,6 +565,17 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
             .update_kv_snapshot(snapshot, registered)
     }
 
+    fn update_queue_snapshot(
+        &self,
+        snapshot: super::QueueSnapshot,
+        registered: &[String],
+    ) -> Result<usize, String> {
+        self.placement
+            .as_ref()
+            .ok_or("session placement is disabled")?
+            .update_queue_snapshot(snapshot, registered)
+    }
+
     fn name(&self) -> &'static str {
         "consistent_hash"
     }

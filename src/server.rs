@@ -547,12 +547,19 @@ async fn reset_session_placement(
 async fn update_session_placement(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(snapshot): Json<crate::policies::KvSnapshot>,
+    Json(snapshot): Json<crate::policies::PlacementSnapshot>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
-    state.router.update_session_placement(snapshot)
+    match snapshot {
+        crate::policies::PlacementSnapshot::Kv(snapshot) => {
+            state.router.update_session_placement(snapshot)
+        }
+        crate::policies::PlacementSnapshot::Queue(snapshot) => {
+            state.router.update_session_queue(snapshot)
+        }
+    }
 }
 
 async fn get_loads(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {

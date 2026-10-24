@@ -179,6 +179,13 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         )
             .into_response()
     }
+    fn update_session_queue(&self, _snapshot: crate::policies::QueueSnapshot) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "queue spill placement unsupported",
+        )
+            .into_response()
+    }
 
     /// Get router type name
     fn router_type(&self) -> &'static str;

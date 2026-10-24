@@ -19,6 +19,7 @@ mod registry;
 mod rendezvous_hash;
 mod round_robin;
 mod session_placement;
+mod session_spill;
 
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hash::ConsistentHashPolicy;
@@ -31,6 +32,7 @@ pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
 pub use session_placement::{SessionLease, TokenPlacement};
+pub use session_spill::{PlacementSnapshot, QueueObservation, QueueSnapshot, SessionSpillConfig};
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value
@@ -131,6 +133,14 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Returns the number of sessions released.
     fn release_session_owners(&self) -> usize {
         0 // Default: the policy keeps no session ownership
+    }
+
+    fn update_queue_snapshot(
+        &self,
+        _snapshot: QueueSnapshot,
+        _registered: &[String],
+    ) -> Result<usize, String> {
+        Err("queue spill placement is disabled".into())
     }
 
     /// Get policy name for metrics and debugging
