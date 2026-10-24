@@ -637,7 +637,7 @@ mod tests {
                 ("outstanding", 100, 1),
             ] {
                 state.sessions.insert(
-                    key.into(),
+                    format!("header:x-session-id:{key}"),
                     Session {
                         worker: w[0].url().to_owned(),
                         inflight,
@@ -650,7 +650,12 @@ mod tests {
         let abort = Some(r#"{"request_ids":["r"]}"#);
         assert!(p.choose(&w, abort, Some(&h), false, now, 100.0).is_none());
         // The global sweep did not run merely because a request arrived.
-        assert!(p.state.lock().unwrap().sessions.contains_key("unaddressed"));
+        assert!(p
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key("header:x-session-id:unaddressed"));
         for key in ["retained", "outstanding"] {
             let headers = HashMap::from([("x-session-id".into(), key.into())]);
             assert_eq!(
@@ -663,9 +668,14 @@ mod tests {
         // A periodic sweep clears only settled expired owners.
         p.choose(&w, None, None, false, now + Duration::from_secs(10), 100.0);
         let state = p.state.lock().unwrap();
-        assert!(!state.sessions.contains_key("unaddressed"));
-        assert!(!state.sessions.contains_key("retained"));
-        assert_eq!(state.sessions["outstanding"].inflight, 1);
+        assert!(!state
+            .sessions
+            .contains_key("header:x-session-id:unaddressed"));
+        assert!(!state.sessions.contains_key("header:x-session-id:retained"));
+        assert_eq!(
+            state.sessions["header:x-session-id:outstanding"].inflight,
+            1
+        );
     }
     fn publish(p: &EngineLoadPolicy, w: &[Arc<dyn Worker>], queues: &[u64], kv: &[f64], time: f64) {
         p.update_at(
@@ -1142,9 +1152,4 @@ mod tests {
             &w.iter().map(|w| w.url().into()).collect::<Vec<_>>(),
             101.0,
         )
-        .unwrap();
-        assert!(p
-            .choose(&w, None, None, true, Instant::now(), 101.0)
-            .is_none());
-    }
-}
+        .u
