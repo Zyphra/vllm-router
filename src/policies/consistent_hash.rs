@@ -377,7 +377,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
                     .iter()
                     .map(|&idx| workers[idx].url())
                     .collect();
-                let target = placement.place(&hash_key, request_text, &healthy);
+                let target = placement.try_place(&hash_key, request_text, &healthy)?;
                 let idx = healthy_indices
                     .iter()
                     .copied()
@@ -533,7 +533,8 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
                     .iter()
                     .map(|&idx| workers[idx].url())
                     .collect();
-                let (target, lease) = placement.place_and_lease(&hash_key, request_text, &healthy);
+                let (target, lease) =
+                    placement.try_place_and_lease(&hash_key, request_text, &healthy)?;
                 let idx = healthy_indices
                     .into_iter()
                     .find(|&idx| workers[idx].url() == target)?;
@@ -548,11 +549,20 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
     }
 
     fn session_placement(&self) -> &'static str {
-        if self.placement.is_some() {
-            "least_tokens"
-        } else {
-            "hash"
-        }
+        self.placement
+            .as_ref()
+            .map_or("hash", |placement| placement.mode())
+    }
+
+    fn update_kv_snapshot(
+        &self,
+        snapshot: super::KvSnapshot,
+        registered: &[String],
+    ) -> Result<usize, String> {
+        self.placement
+            .as_ref()
+            .ok_or("KV placement is disabled")?
+            .update_kv_snapshot(snapshot, registered)
     }
 
     fn name(&self) -> &'static str {

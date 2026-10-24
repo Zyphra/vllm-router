@@ -308,7 +308,27 @@ This keeps prompt arrays out of the generation wait while preserving request
 IDs in transport errors and the response lease through completion or drop.
 
 `GET /session_placement` reports `atomic_select_and_lease: true` and the effective
-`placement` (`hash` or `least_tokens`). The reset response includes the same
+`placement` (`hash`, `least_tokens` or `kv_aware`). The reset response includes the same
 metadata and `released_sessions`. Both endpoints use the router's request
 authorization. Clients enabling token placement can verify these capabilities
 before dispatching requests.
+
+`VLLM_ROUTER_SESSION_PLACEMENT=kv_aware` retains the same session owners and
+leases, but places a new session on the healthy engine with the most free KV
+tokens. The existing control-plane census publishes `POST /session_placement`
+with `workers: [{worker_url, observed_at, kv_usage, waiting, capacity_tokens}]`. URLs must
+match registered workers exactly, including their data-parallel rank suffix.
+Times are Unix seconds, usage is a finite fraction, and capacity is the native
+positive token capacity. Unknown, missing, older-than-15-second or projected
+usage at or above0.80 or nonzero engine waiting is ineligible. New prompts reserve against the existing
+counted session load atomically; a repeated observation cannot reset that
+reservation baseline. New census observations never move an existing owner.
+
+When no eligible engine can admit a new native `/verl/v1/generate` session,
+the Router returns HTTP429 with the exact `kv-capacity-v1`, `never_dispatched`
+receipt and request/session identity. This mode requires the paired native
+client: it retries only this receipt within the original request deadline,
+without an engine abort for a request proved never dispatched. Other errors
+retain ordinary abort and settlement. There is no request-path metrics scrape,
+pending-request registry or new dispatch queue. Gauges are delayed observations,
+so this placement threshold is not a guarantee against subsequent context growth.

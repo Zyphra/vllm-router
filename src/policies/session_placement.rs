@@ -22,9 +22,11 @@
 //! otherwise it is estimated as body bytes / 4 and only ever grows, so an
 //! abort-shaped body neither moves nor shrinks a session.
 
+use super::kv_capacity::{KvCapacity, KvSnapshot};
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const PLACEMENT_ENV: &str = "VLLM_ROUTER_SESSION_PLACEMENT";
 pub const IDLE_SECS_ENV: &str = "VLLM_ROUTER_SESSION_IDLE_SECS";
@@ -56,6 +58,7 @@ struct State {
     sessions: HashMap<String, Session>,
     loads: HashMap<String, Load>,
     last_sweep: Instant,
+    capacity: KvCapacity,
 }
 
 impl State {
@@ -105,6 +108,7 @@ impl Drop for SessionLease {
 #[derive(Debug)]
 pub struct TokenPlacement {
     idle: Duration,
+    kv_aware: bool,
     state: Mutex<State>,
 }
 
@@ -112,19 +116,26 @@ impl TokenPlacement {
     pub fn new(idle: Duration) -> Self {
         Self {
             idle,
+            kv_aware: false,
             state: Mutex::new(State {
                 sessions: HashMap::new(),
                 loads: HashMap::new(),
                 last_sweep: Instant::now(),
+                capacity: KvCapacity::default(),
             }),
         }
+    }
+
+    pub fn with_kv_capacity(mut self) -> Self {
+        self.kv_aware = true;
+        self
     }
 
     /// Build from the environment; `None` keeps plain consistent hashing.
     pub fn from_env() -> Option<Self> {
         match std::env::var(PLACEMENT_ENV).ok().as_deref() {
             None | Some("") | Some("hash") => None,
-            Some("least_tokens") => {
+            Some(mode @ ("least_tokens" | "kv_aware")) => {
                 let idle = match std::env::var(IDLE_SECS_ENV).ok().as_deref() {
                     None | Some("") => DEFAULT_IDLE_SECS,
                     Some(value) => match value.parse::<u64>() {
@@ -132,10 +143,18 @@ impl TokenPlacement {
                         _ => panic!("{IDLE_SECS_ENV} must be a positive integer, got {value:?}"),
                     },
                 };
-                Some(Self::new(Duration::from_secs(idle)))
+                let placement = Self::new(Duration::from_secs(idle));
+                let placement = if mode == "kv_aware" {
+                    placement.with_kv_capacity()
+                } else {
+                    placement
+                };
+                Some(placement)
             }
             Some(other) => {
-                panic!("{PLACEMENT_ENV} must be 'hash' or 'least_tokens', got {other:?}")
+                panic!(
+                    "{PLACEMENT_ENV} must be 'hash', 'least_tokens' or 'kv_aware', got {other:?}"
+                )
             }
         }
     }
@@ -149,6 +168,18 @@ impl TokenPlacement {
         self.place_at(key, request_text, healthy, Instant::now())
     }
 
+    pub fn try_place(
+        &self,
+        key: &str,
+        request_text: Option<&str>,
+        healthy: &[&str],
+    ) -> Option<String> {
+        let tokens = prompt_token_count(request_text);
+        let estimate = request_text.map_or(0, |text| text.len() as u64 / 4);
+        let mut state = self.state.lock().unwrap();
+        self.place_locked(&mut state, key, (tokens, estimate), healthy, Instant::now())
+    }
+
     fn place_at(
         &self,
         key: &str,
@@ -160,6 +191,7 @@ impl TokenPlacement {
         let estimate = request_text.map_or(0, |text| text.len() as u64 / 4);
         let mut state = self.state.lock().unwrap();
         self.place_locked(&mut state, key, (tokens, estimate), healthy, now)
+            .expect("no fresh KV capacity for session placement")
     }
 
     /// Select and reserve the owner in one transaction. Hold the returned lease
@@ -170,19 +202,29 @@ impl TokenPlacement {
         request_text: Option<&str>,
         healthy: &[&str],
     ) -> (String, SessionLease) {
+        self.try_place_and_lease(key, request_text, healthy)
+            .expect("no fresh KV capacity for session placement")
+    }
+
+    pub fn try_place_and_lease(
+        self: &Arc<Self>,
+        key: &str,
+        request_text: Option<&str>,
+        healthy: &[&str],
+    ) -> Option<(String, SessionLease)> {
         let now = Instant::now();
         // Request-only scanning must not serialize every placement and lease
         // behind a long prompt while occupying the async runtime's workers.
         let tokens = prompt_token_count(request_text);
         let estimate = request_text.map_or(0, |text| text.len() as u64 / 4);
         let mut state = self.state.lock().unwrap();
-        let worker = self.place_locked(&mut state, key, (tokens, estimate), healthy, now);
+        let worker = self.place_locked(&mut state, key, (tokens, estimate), healthy, now)?;
         state.sessions.get_mut(key).unwrap().inflight += 1;
         let lease = SessionLease::Session {
             placement: Arc::clone(self),
             key: key.to_string(),
         };
-        (worker, lease)
+        Some((worker, lease))
     }
 
     fn place_locked(
@@ -192,7 +234,7 @@ impl TokenPlacement {
         context: (Option<u64>, u64),
         healthy: &[&str],
         now: Instant,
-    ) -> String {
+    ) -> Option<String> {
         let (exact, estimate) = context;
         self.sweep(state, now);
 
@@ -200,15 +242,44 @@ impl TokenPlacement {
             !healthy.contains(&session.worker.as_str())
                 || (session.released && session.inflight == 0)
         });
-        if owner_gone || !state.sessions.contains_key(key) {
+        let new_owner = owner_gone || !state.sessions.contains_key(key);
+        let previous_tokens = state.sessions.get(key).map_or(0, |session| session.tokens);
+        if new_owner {
             // Re-placing an existing session keeps its in-flight count, so its
             // outstanding leases still settle against it.
+            let worker = if self.kv_aware {
+                let prompt = exact.unwrap_or(previous_tokens.max(estimate));
+                let observed_now = unix_now();
+                healthy
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, worker)| {
+                        state
+                            .capacity
+                            .free_after(
+                                worker,
+                                prompt,
+                                observed_now,
+                                state.loads.get(*worker).map_or(0, |load| load.tokens),
+                            )
+                            .map(|free| (index, *worker, free))
+                    })
+                    .max_by_key(|(index, worker, free)| {
+                        (
+                            *free,
+                            Reverse(state.loads.get(*worker).copied().unwrap_or_default()),
+                            Reverse(*index),
+                        )
+                    })?
+                    .1
+                    .to_string()
+            } else {
+                healthy
+                    .iter()
+                    .min_by_key(|worker| state.loads.get(**worker).copied().unwrap_or_default())?
+                    .to_string()
+            };
             state.set_counted(key, false);
-            let worker = healthy
-                .iter()
-                .min_by_key(|worker| state.loads.get(**worker).copied().unwrap_or_default())
-                .expect("placement requires at least one healthy worker")
-                .to_string();
             let session = state.sessions.entry(key.to_string()).or_insert(Session {
                 worker: String::new(),
                 tokens: 0,
@@ -227,7 +298,34 @@ impl TokenPlacement {
         session.last_seen = now;
         let worker = session.worker.clone();
         state.set_counted(key, true);
-        worker
+        Some(worker)
+    }
+
+    pub fn mode(&self) -> &'static str {
+        if self.kv_aware {
+            "kv_aware"
+        } else {
+            "least_tokens"
+        }
+    }
+
+    pub fn update_kv_snapshot(
+        &self,
+        snapshot: KvSnapshot,
+        registered: &[String],
+    ) -> Result<usize, String> {
+        if !self.kv_aware {
+            return Err("KV updates require kv_aware session placement".into());
+        }
+        let mut state = self.state.lock().unwrap();
+        let State {
+            capacity, loads, ..
+        } = &mut *state;
+        let count = capacity.update(snapshot, registered, unix_now(), |worker| {
+            loads.get(worker).map_or(0, |load| load.tokens)
+        })?;
+        drop(state);
+        Ok(count)
     }
 
     /// Release every session's owner (the prefix caches were reset): each session
@@ -237,6 +335,21 @@ impl TokenPlacement {
         let mut state = self.state.lock().unwrap();
         for session in state.sessions.values_mut() {
             session.released = true;
+        }
+        if self.kv_aware {
+            // The explicit weight-reset operation emptied the prefix cache.
+            // Idle old contexts must not become the next census load baseline:
+            // re-admitting them now allocates KV again. In-flight owners keep
+            // their existing reservation and abort routing until they settle.
+            let idle: Vec<_> = state
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.inflight == 0)
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in idle {
+                state.set_counted(&key, false);
+            }
         }
         state.sessions.len()
     }
@@ -302,6 +415,13 @@ impl TokenPlacement {
     }
 }
 
+fn unix_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
 /// Number of entries in the body's flat `prompt_ids` array, if it has one.
 pub fn prompt_token_count(request_text: Option<&str>) -> Option<u64> {
     const FIELD: &str = "\"prompt_ids\"";
@@ -322,6 +442,202 @@ pub fn prompt_token_count(request_text: Option<&str>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kv_placement(rows: &[(&str, f64, u64)]) -> Arc<TokenPlacement> {
+        let placement = TokenPlacement::new(Duration::from_secs(900)).with_kv_capacity();
+        let placement = Arc::new(placement);
+        publish(&placement, rows);
+        placement
+    }
+
+    fn publish(placement: &TokenPlacement, rows: &[(&str, f64, u64)]) {
+        let observed_at = unix_now();
+        placement
+            .update_kv_snapshot(
+                KvSnapshot {
+                    workers: rows
+                        .iter()
+                        .map(|(worker, usage, capacity)| super::super::KvObservation {
+                            worker_url: worker.to_string(),
+                            observed_at,
+                            kv_usage: *usage,
+                            waiting: 0,
+                            capacity_tokens: *capacity,
+                        })
+                        .collect(),
+                },
+                &rows
+                    .iter()
+                    .map(|(worker, _, _)| worker.to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn kv_ranks_free_tokens_skips_limit_and_preserves_existing_owners() {
+        let placement = kv_placement(&[("a@0", 0.5, 1000), ("b@0", 0.7, 2000)]);
+        let (owner, lease) = placement
+            .try_place_and_lease("s", Some(&body(100)), &["a@0", "b@0"])
+            .unwrap();
+        assert_eq!(owner, "b@0"); // More free tokens despite a larger fraction used.
+        publish(&placement, &[("a@0", 0.2, 1000), ("b@0", 0.99, 2000)]);
+        let (same, next) = placement
+            .try_place_and_lease("s", Some(&body(200)), &["a@0", "b@0"])
+            .unwrap();
+        assert_eq!(same, owner); // Census changes never move a live owner.
+        assert_eq!(
+            placement
+                .try_place_and_lease("new", Some(&body(100)), &["a@0", "b@0"])
+                .unwrap()
+                .0,
+            "a@0"
+        );
+        drop((lease, next));
+    }
+
+    #[test]
+    fn kv_missing_full_or_oversized_new_sessions_have_no_owner_or_reservation() {
+        let placement = kv_placement(&[("a@0", 0.85, 1000)]);
+        assert!(placement
+            .try_place_and_lease("full", Some(&body(1)), &["a@0"])
+            .is_none());
+        publish(&placement, &[("a@0", 0.1, 1000)]);
+        assert!(placement
+            .try_place_and_lease("oversized", Some(&body(750)), &["a@0"])
+            .is_none());
+        placement
+            .update_kv_snapshot(KvSnapshot { workers: vec![] }, &["a@0".to_string()])
+            .unwrap();
+        assert!(placement
+            .try_place_and_lease("missing", Some(&body(1)), &["a@0"])
+            .is_none());
+        assert!(placement.state.lock().unwrap().sessions.is_empty());
+        assert_eq!(tokens_on(&placement, "a@0"), 0);
+    }
+
+    #[test]
+    fn kv_concurrent_requests_reserve_existing_load_atomically() {
+        let placement = kv_placement(&[("a@0", 0.5, 1000), ("b@0", 0.5, 1000)]);
+        let barrier = Arc::new(std::sync::Barrier::new(32));
+        let handles: Vec<_> = (0..32)
+            .map(|i| {
+                let placement = placement.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    placement.try_place_and_lease(
+                        &format!("s{i}"),
+                        Some(&body(100)),
+                        &["a@0", "b@0"],
+                    )
+                })
+            })
+            .collect();
+        let admitted: Vec<_> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(admitted.len(), 4);
+        assert_eq!(tokens_on(&placement, "a@0"), 200);
+        assert_eq!(tokens_on(&placement, "b@0"), 200);
+        assert_eq!(placement.state.lock().unwrap().sessions.len(), 4);
+        drop(admitted);
+    }
+
+    #[test]
+    fn kv_membership_recovery_uses_only_an_eligible_survivor() {
+        let placement = kv_placement(&[("a@0", 0.1, 1000), ("b@0", 0.5, 1000)]);
+        let (owner, first) = placement
+            .try_place_and_lease("s", Some(&body(100)), &["a@0", "b@0"])
+            .unwrap();
+        assert_eq!(owner, "a@0");
+        drop(first);
+        assert_eq!(
+            placement
+                .try_place_and_lease("s", Some(&body(110)), &["b@0"])
+                .unwrap()
+                .0,
+            "b@0"
+        );
+    }
+
+    #[test]
+    fn kv_weight_reset_reserves_readmitted_idle_contexts_again() {
+        let placement = kv_placement(&[("a@0", 0.0, 1000), ("b@0", 0.0, 1000)]);
+        for i in 0..6 {
+            let (_, lease) = placement
+                .try_place_and_lease(&format!("s{i}"), Some(&body(100)), &["a@0", "b@0"])
+                .unwrap();
+            drop(lease);
+        }
+        assert_eq!(
+            tokens_on(&placement, "a@0") + tokens_on(&placement, "b@0"),
+            600
+        );
+        assert_eq!(placement.release_owners(), 6);
+        assert_eq!(
+            tokens_on(&placement, "a@0") + tokens_on(&placement, "b@0"),
+            0
+        );
+        publish(&placement, &[("a@0", 0.0, 1000), ("b@0", 0.0, 1000)]);
+        let admitted: Vec<_> = (0..18)
+            .filter_map(|i| {
+                placement.try_place_and_lease(&format!("s{i}"), Some(&body(100)), &["a@0", "b@0"])
+            })
+            .collect();
+        assert_eq!(admitted.len(), 14);
+        assert_eq!(tokens_on(&placement, "a@0"), 700);
+        assert_eq!(tokens_on(&placement, "b@0"), 700);
+        drop(admitted);
+    }
+
+    #[test]
+    fn heterogeneous_waiting_filters_only_new_sessions() {
+        let placement = kv_placement(&[("hot@0", 0.79, 1000), ("cool@0", 0.7, 1000)]);
+        let update = || super::super::KvSnapshot {
+            workers: vec![
+                super::super::KvObservation {
+                    worker_url: "hot@0".into(),
+                    observed_at: unix_now(),
+                    kv_usage: 0.79,
+                    waiting: 22,
+                    capacity_tokens: 1000,
+                },
+                super::super::KvObservation {
+                    worker_url: "cool@0".into(),
+                    observed_at: unix_now(),
+                    kv_usage: 0.7,
+                    waiting: 0,
+                    capacity_tokens: 1000,
+                },
+            ],
+        };
+        placement
+            .update_kv_snapshot(update(), &["hot@0".into(), "cool@0".into()])
+            .unwrap();
+        let (owner, lease) = placement
+            .try_place_and_lease("resident", Some(&body(10)), &["hot@0", "cool@0"])
+            .unwrap();
+        assert_eq!(owner, "cool@0");
+        placement
+            .update_kv_snapshot(
+                super::super::KvSnapshot { workers: vec![] },
+                &["hot@0".into(), "cool@0".into()],
+            )
+            .unwrap();
+        assert!(placement
+            .try_place_and_lease("new", Some(&body(10)), &["hot@0", "cool@0"])
+            .is_none());
+        assert_eq!(
+            placement
+                .try_place_and_lease("resident", Some(&body(20)), &["hot@0", "cool@0"])
+                .unwrap()
+                .0,
+            owner
+        );
+        drop(lease);
+    }
 
     fn body(tokens: usize) -> String {
         let ids: Vec<String> = (0..tokens).map(|i| (i % 1000).to_string()).collect();

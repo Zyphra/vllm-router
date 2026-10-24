@@ -1646,6 +1646,19 @@ impl RouterTrait for Router {
         .into_response()
     }
 
+    fn update_session_placement(&self, snapshot: crate::policies::KvSnapshot) -> Response {
+        let policy = self.policy_registry.get_default_policy();
+        match policy.update_kv_snapshot(snapshot, &self.get_worker_urls()) {
+            Ok(count) => Json(serde_json::json!({
+                "atomic_select_and_lease": true,
+                "placement": policy.session_placement(),
+                "accepted_workers": count,
+            }))
+            .into_response(),
+            Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+        }
+    }
+
     async fn get_worker_loads(&self) -> Response {
         let urls = self.get_worker_urls();
         let mut loads = Vec::new();
@@ -1731,6 +1744,29 @@ impl RouterTrait for Router {
         ) {
             Some(idx) => idx,
             None => {
+                if policy.session_placement() == "kv_aware" && path == "/verl/v1/generate" {
+                    if let (Some(request_id), Some(session_id)) = (
+                        body.get("request_id").and_then(serde_json::Value::as_str),
+                        request_headers
+                            .as_ref()
+                            .and_then(|headers| headers.get("x-session-id")),
+                    ) {
+                        // No owner or physical request was admitted. The native
+                        // caller may retry this exact receipt within its deadline.
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            Json(serde_json::json!({
+                                "router_admission": "kv-capacity-v1",
+                                "placement": "kv_aware",
+                                "never_dispatched": true,
+                                "request_id": request_id,
+                                "session_id": session_id,
+                                "retry_after_s": 10,
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Failed to select a worker".to_string(),
@@ -1841,6 +1877,85 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn kv_capacity_receipt_precedes_any_backend_dispatch_and_recovers() {
+        use crate::policies::{ConsistentHashPolicy, KvObservation, KvSnapshot, TokenPlacement};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = calls.clone();
+        let backend = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/verl/v1/generate",
+                axum::routing::post(move || {
+                    captured.fetch_add(1, Ordering::SeqCst);
+                    async { Json(serde_json::json!({"ok": true})) }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router
+            .worker_registry
+            .register(Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular)));
+        router.policy_registry = Arc::new(PolicyRegistry::with_default_policy(Arc::new(
+            ConsistentHashPolicy::with_placement(Some(
+                TokenPlacement::new(Duration::from_secs(900)).with_kv_capacity(),
+            )),
+        )));
+        let snapshot = |usage| KvSnapshot {
+            workers: vec![KvObservation {
+                worker_url: url.clone(),
+                kv_usage: usage,
+                waiting: 0,
+                capacity_tokens: 1000,
+                observed_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64(),
+            }],
+        };
+        assert_eq!(
+            router.update_session_placement(snapshot(0.9)).status(),
+            StatusCode::OK
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("s"));
+        let body = serde_json::json!({"request_id": "r", "prompt_ids": [1, 2]});
+        let response = router
+            .route_transparent(
+                Some(&headers),
+                "/verl/v1/generate",
+                &Method::POST,
+                body.clone(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(
+            receipt,
+            serde_json::json!({
+                "router_admission": "kv-capacity-v1", "placement": "kv_aware", "never_dispatched": true,
+                "request_id": "r", "session_id": "s", "retry_after_s": 10,
+            })
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            router.update_session_placement(snapshot(0.1)).status(),
+            StatusCode::OK
+        );
+        let response = router
+            .route_transparent(Some(&headers), "/verl/v1/generate", &Method::POST, body)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        backend.abort();
+    }
 
     fn create_test_regular_router() -> Router {
         // Create registries
