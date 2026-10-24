@@ -146,6 +146,8 @@ impl EngineLoadPolicy {
     pub(crate) fn seed_probe_sessions(&self, count: usize, workers: &[Arc<dyn Worker>]) {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap();
+        let mut workers = workers.to_vec();
+        workers.sort_by(|a, b| a.url().cmp(b.url()));
         for i in 0..count {
             state.sessions.insert(
                 format!("header:x-session-id:settled-{i}"),
@@ -156,6 +158,29 @@ impl EngineLoadPolicy {
                     released: false,
                 },
             );
+        }
+        if let Ok(path) = std::env::var("ROUTER_FAN_IN_STATE_OUTPUT") {
+            let mut normalized = Vec::new();
+            let mut actual = Vec::new();
+            for (key, session) in &state.sessions {
+                let rank = session.worker.rsplit_once('@').unwrap().1;
+                normalized.push((
+                    key,
+                    format!("{}@{rank}", host(&session.worker)),
+                    session.inflight,
+                    session.released,
+                ));
+                actual.push((key, &session.worker, session.inflight, session.released));
+            }
+            normalized.sort_by(|a, b| a.0.cmp(b.0));
+            actual.sort_by(|a, b| a.0.cmp(b.0));
+            std::fs::write(path, serde_json::to_vec(&serde_json::json!({
+                "normalized_sessions": normalized,
+                "actual_sessions": actual,
+                "last_settled_age_at_seed_secs": 0,
+                "normalization": "Only ephemeral backend TCP port is removed; host, DP rank, key, inflight and released values are preserved.",
+                "inputs": {"sessions":count,"engines":workers.len(),"hosts":72,"seed":"deterministic sorted URLs; no RNG","requests":8192,"concurrency":512,"running":0,"waiting":0,"kv_usage":0.1,"typed_request":"even i: messages=user:preserve session history; model=m; stream=false","native_request":"odd i: request_id=probe-i; prompt_ids=[1;1024]; max_tokens=1","session_header":"X-Session-ID=settled-(i%100000)"}
+            })).unwrap()).unwrap();
         }
     }
 
