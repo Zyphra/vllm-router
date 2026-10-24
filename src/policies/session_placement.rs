@@ -461,6 +461,7 @@ mod tests {
                             worker_url: worker.to_string(),
                             observed_at,
                             kv_usage: *usage,
+                            waiting: 0,
                             capacity_tokens: *capacity,
                         })
                         .collect(),

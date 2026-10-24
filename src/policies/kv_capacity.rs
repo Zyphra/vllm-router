@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
 pub const MAX_AGE_SECS: f64 = 15.0;
-pub const MAX_USAGE: f64 = 0.85;
+pub const MAX_USAGE: f64 = 0.80;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +13,7 @@ pub struct KvObservation {
     pub worker_url: String,
     pub observed_at: f64,
     pub kv_usage: f64,
+    pub waiting: u64,
     pub capacity_tokens: u64,
 }
 
@@ -67,6 +68,7 @@ impl KvCapacity {
                 }
                 if row.observed_at == old.observation.observed_at {
                     if row.kv_usage != old.observation.kv_usage
+                        || row.waiting != old.observation.waiting
                         || row.capacity_tokens != old.observation.capacity_tokens
                     {
                         return Err("conflicting repeated KV observation".into());
@@ -111,7 +113,7 @@ impl KvCapacity {
         counted_tokens: u64,
     ) -> Option<u64> {
         let row = self.workers.get(worker)?;
-        if !row.present {
+        if !row.present || row.observation.waiting > 0 {
             return None;
         }
         let observation = &row.observation;
@@ -137,6 +139,7 @@ mod tests {
             worker_url: worker.into(),
             observed_at,
             kv_usage: usage,
+            waiting: 0,
             capacity_tokens: capacity,
         }
     }
@@ -184,12 +187,12 @@ mod tests {
         let mut capacity = KvCapacity::default();
         let registered = vec!["a@0".into()];
         let snapshot = || KvSnapshot {
-            workers: vec![row("a@0", 0.8, 1000, 100.0)],
+            workers: vec![row("a@0", 0.75, 1000, 100.0)],
         };
         capacity
             .update(snapshot(), &registered, 100.0, |_| 0)
             .unwrap();
-        assert_eq!(capacity.free_after("a@0", 49, 100.0, 0), Some(151));
+        assert_eq!(capacity.free_after("a@0", 49, 100.0, 0), Some(201));
         assert_eq!(capacity.free_after("a@0", 50, 100.0, 0), None);
         capacity
             .update(snapshot(), &registered, 100.0, |_| 0)
@@ -207,5 +210,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(capacity.free_after("a@0", 0, 101.0, 49), Some(300));
+        let mut queued = row("a@0", 0.5, 1000, 102.0);
+        queued.waiting = 1;
+        capacity
+            .update(
+                KvSnapshot {
+                    workers: vec![queued],
+                },
+                &registered,
+                102.0,
+                |_| 49,
+            )
+            .unwrap();
+        assert_eq!(capacity.free_after("a@0", 0, 102.0, 49), None);
     }
 }

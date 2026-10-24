@@ -316,11 +316,11 @@ before dispatching requests.
 `VLLM_ROUTER_SESSION_PLACEMENT=kv_aware` retains the same session owners and
 leases, but places a new session on the healthy engine with the most free KV
 tokens. The existing control-plane census publishes `POST /session_placement`
-with `workers: [{worker_url, observed_at, kv_usage, capacity_tokens}]`. URLs must
+with `workers: [{worker_url, observed_at, kv_usage, waiting, capacity_tokens}]`. URLs must
 match registered workers exactly, including their data-parallel rank suffix.
 Times are Unix seconds, usage is a finite fraction, and capacity is the native
 positive token capacity. Unknown, missing, older-than-15-second or projected
-usage at or above0.85 is ineligible. New prompts reserve against the existing
+usage at or above0.80 or nonzero engine waiting is ineligible. New prompts reserve against the existing
 counted session load atomically; a repeated observation cannot reset that
 reservation baseline. New census observations never move an existing owner.
 

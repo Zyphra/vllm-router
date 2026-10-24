@@ -1910,6 +1910,7 @@ mod tests {
             workers: vec![KvObservation {
                 worker_url: url.clone(),
                 kv_usage: usage,
+                waiting: 0,
                 capacity_tokens: 1000,
                 observed_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
