@@ -125,15 +125,6 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         self.select_worker_with_lease(workers, text, headers)
     }
 
-    /// Whether a refused selection is safe for a new-request retry.
-    fn unselected_is_new_request(
-        &self,
-        _text: Option<&str>,
-        _headers: Option<&RequestHeaders>,
-    ) -> bool {
-        false
-    }
-
     /// Effective session placement mode, for capability admission.
     fn session_placement(&self) -> &'static str {
         "none"

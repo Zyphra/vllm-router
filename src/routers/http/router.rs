@@ -1755,35 +1755,6 @@ impl RouterTrait for Router {
         let (worker_idx, lease) = match selection {
             Some(idx) => idx,
             None => {
-                if policy.session_placement() == "engine_load"
-                    && path == "/verl/v1/generate"
-                    && policy.unselected_is_new_request(
-                        request_text.as_deref(),
-                        request_headers.as_ref(),
-                    )
-                {
-                    if let (Some(request_id), Some(session_id)) = (
-                        body.get("request_id").and_then(serde_json::Value::as_str),
-                        request_headers
-                            .as_ref()
-                            .and_then(|headers| headers.get("x-session-id")),
-                    ) {
-                        // No owner or physical request was admitted. The native
-                        // caller may retry this exact receipt within its deadline.
-                        return (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            Json(serde_json::json!({
-                                "router_admission": "engine-load-v1",
-                                "placement": "engine_load",
-                                "never_dispatched": true,
-                                "request_id": request_id,
-                                "session_id": session_id,
-                                "retry_after_s": 2,
-                            })),
-                        )
-                            .into_response();
-                    }
-                }
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Failed to select a worker".to_string(),
@@ -2645,14 +2616,16 @@ mod tests {
         .unwrap()
     }
 
-    async fn heavy_on(policy: &Arc<dyn LoadBalancingPolicy>, owner: &str) {
-        // Force a settled-owner spill using measured queue gauges, never token
-        // lengths or local worker-load counters.
-        let engine = policy
+    async fn heavy_on(
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        owner: &str,
+        workers: &[Arc<dyn Worker>],
+    ) -> Vec<crate::policies::SessionLease> {
+        policy
             .as_any()
             .downcast_ref::<crate::policies::EngineLoadPolicy>()
-            .unwrap();
-        engine.test_set_queue(owner, 100);
+            .unwrap()
+            .test_hold_requests(workers, owner, 100)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2679,7 +2652,7 @@ mod tests {
                 .await,
         )
         .await;
-        heavy_on(&policy, &owner).await;
+        let _load = heavy_on(&policy, &owner, &router.worker_registry.get_all()).await;
         let resetting = Arc::clone(&router);
         let resetter = tokio::spawn(async move {
             for _ in 0..100 {
@@ -2754,7 +2727,7 @@ mod tests {
                 .await,
         )
         .await;
-        heavy_on(&policy, &owner).await;
+        let _load = heavy_on(&policy, &owner, &router.worker_registry.get_all()).await;
         router.reset_session_placement().await;
         drop(generation);
         assert_ne!(
@@ -2785,7 +2758,7 @@ mod tests {
             .unwrap();
         let owner = worker.url().to_string();
         drop(lease);
-        heavy_on(&policy, &owner).await;
+        let _load = heavy_on(&policy, &owner, &router.worker_registry.get_all()).await;
         for (url, _, task) in &backends {
             if url == &owner {
                 task.abort();
@@ -2838,7 +2811,7 @@ mod tests {
                 .await,
         )
         .await;
-        heavy_on(&policy, &owner).await;
+        let _load = heavy_on(&policy, &owner, &router.worker_registry.get_all()).await;
         router.reset_session_placement().await;
         assert_eq!(
             response_text(
@@ -3133,7 +3106,12 @@ mod tests {
             StatusCode::OK
         );
         let owner = seen.lock().await[0].0.clone();
-        heavy_on(&router.policy_registry.get_default_policy(), &owner).await;
+        let _load = heavy_on(
+            &router.policy_registry.get_default_policy(),
+            &owner,
+            &router.worker_registry.get_all(),
+        )
+        .await;
         assert_eq!(
             app.clone().oneshot(send()).await.unwrap().status(),
             StatusCode::OK

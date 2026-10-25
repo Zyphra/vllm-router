@@ -208,7 +208,7 @@ The router supports multiple load balancing policies:
 |--------|-------------|------------------|----------|
 | `round_robin` | Sequential distribution across workers | No | General purpose, even distribution |
 | `random` | Uniform random selection | No | Simple deployments |
-| `engine_load` | Actual engine running+waiting, KV tie, safe soft affinity | Yes | Every wrapper router |
+| `engine_load` | Router-owned outstanding HTTP requests, safe soft affinity | Yes | Every wrapper router |
 | `power_of_two` | Picks least loaded of two random workers | No | Load-sensitive workloads |
 | `cache_aware` | Optimizes for prefix cache hits | Yes | Repeated prompts, few-shot |
 
@@ -280,42 +280,15 @@ This project is a fork of [SGLang Model Gateway](https://github.com/sgl-project/
 ### Shared engine-load placement
 
 All wrapper HTTP routers use `--policy engine_load`: training rollout, judges,
-user simulation, evaluation and public serve. The existing census publishes
-`POST /session_placement` every two seconds with
-`{"workers":[{"worker_url":"http://worker:8000@0","observed_at":123.0,"running":2,"waiting":1,"kv_usage":0.4}]}`.
-URLs include their registered DP rank. Observations must be finite, monotonic,
-no older than six seconds, and cover every healthy rank on at least90% of hosts.
-The Router adds no request-path scrape or collector. Queue load is engine
-running+waiting plus reservations made since that engine's last observation;
-KV usage breaks equal-load ties. Repeated observations cannot erase reservations.
+user simulation, evaluation and public serve. Placement uses the router's own
+outstanding generation HTTP-request counts, atomically reserved during selection
+and released by the existing response lease. Retained session bindings are not
+load. Equal loads use the least recently selected worker. Healthy workers remain
+eligible with missing, stale or never-published telemetry; no placement feed is
+required and no placement HTTP429 hold is emitted. Optional legacy observation
+POSTs remain accepted but do not control placement.
 
-The same atomic selector serves keyed and headerless typed chat/completions and
-native generation. Typed routes pass generation/control kind explicitly, even
-when their text extraction is empty. A settled session keeps its healthy owner
-while its queue is below `VLLM_ROUTER_SPILL_FACTOR` times the pool median
-(default2). Otherwise its next generation may move to the least-loaded engine.
-Zero-load affinity is retained. `VLLM_ROUTER_SESSION_IDLE_SECS` defaults900;
-expiry starts after the last response settles. Ownership remains available to
-abort for four idle periods. Addressed settled owners expire on each request;
-the full expired-session sweep runs at most once per `min(idle,30s)`. Engine
-host identities are cached, and metrics recording runs outside the placement
-lock. These reduce retained-session cost without changing affinity or abort
-ownership. Neither health loss nor reset can move an
-outstanding request, and abort never selects a replacement owner. An unavailable
-outstanding owner fails closed. Request bodies, IDs and headers are unchanged.
-
-`POST /reset_session_placement` marks owners for re-placement on their next
-settled generation; it does not abort requests or reset model caches.
-`GET /session_placement` and authenticated census ACKs report
-`atomic_select_and_lease:true, placement:"engine_load"`. Missing census quorum
-retains known healthy owners and refuses new blind placement. Native generation
-may receive HTTP429 with `router_admission:"engine-load-v1"`,
-`never_dispatched:true`, exact request/session IDs and `retry_after_s:2` only
-when no outstanding request or control operation can be replayed. Other failures
-remain ordinary HTTP503; the paired native caller retries only the certificate
-within its original deadline.
-
-The old placement-mode environment selector and token/hash/KV-only placement
-modes are removed. Spill factor and idle timeout are shared parameters, with no
-pool-specific algorithm. Delayed gauges and CPU controls do not establish a
-production queue-tail improvement; qualify that with whole-pool observations.
+Existing active owners and aborts retain their exact owner. Unavailable active
+owners fail closed with HTTP503; they are never moved to an unrelated backend.
+Existing soft affinity, idle expiry and settled-session spill semantics remain.
+The capability ACK stays `placement=engine_load`, `atomic_select_and_lease=true`.

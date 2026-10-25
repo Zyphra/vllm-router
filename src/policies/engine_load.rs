@@ -1,4 +1,4 @@
-//! Shared engine-load placement. Census gauges, never token estimates, own load.
+//! Shared placement by router-owned outstanding HTTP requests; telemetry is optional.
 use super::{get_healthy_worker_indices, hash_key, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
@@ -54,6 +54,7 @@ struct State {
     sessions: HashMap<String, Session>,
     epoch: u64,
     sequence: u64,
+    last_selected: HashMap<String, u64>,
 }
 
 /// The response owns this reservation until EOF, failure, cancellation or drop.
@@ -134,13 +135,31 @@ impl Default for EngineLoadPolicy {
 
 impl EngineLoadPolicy {
     #[cfg(test)]
-    pub(crate) fn test_set_queue(&self, owner: &str, queue: u64) {
+    pub(crate) fn test_hold_requests(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        owner: &str,
+        count: usize,
+    ) -> Vec<SessionLease> {
+        let idx = workers.iter().position(|w| w.url() == owner).unwrap();
         let mut state = self.state.lock().unwrap();
-        for (url, reading) in &mut state.readings {
-            reading.observation.running = 0;
-            reading.observation.waiting = if url == owner { queue } else { 0 };
-            reading.observation.observed_at = wall_time();
-        }
+        (0..count)
+            .map(|_| {
+                self.reserve_locked(
+                    &mut state,
+                    workers,
+                    idx,
+                    None,
+                    true,
+                    true,
+                    false,
+                    Instant::now(),
+                )
+                .unwrap()
+                .1
+                .unwrap()
+            })
+            .collect()
     }
     #[cfg(test)]
     pub(crate) fn seed_probe_sessions(&self, count: usize, workers: &[Arc<dyn Worker>]) {
@@ -337,7 +356,7 @@ impl EngineLoadPolicy {
         key: Option<String>,
         reserve: bool,
         instant: Instant,
-        wall: f64,
+        _wall: f64,
         abort: bool,
     ) -> Option<(usize, Option<SessionLease>)> {
         // Preserve the established abort-retention period. Only idle owners can
@@ -383,74 +402,37 @@ impl EngineLoadPolicy {
             return self.reserve_locked(state, workers, idx, key, reserve, !abort, false, instant);
         }
 
-        let mut hosts: HashMap<Arc<str>, (usize, usize)> = HashMap::new();
-        let mut fresh = Vec::new();
-        for &idx in healthy {
-            let url = workers[idx].url();
-            let host_id = match state.host_ids.get(url) {
-                Some(value) => Arc::clone(value),
-                None => {
-                    // An immediately hot-added worker may precede its first
-                    // census; cache its identity once, without inventing load.
-                    let value: Arc<str> = Arc::from(host(url));
-                    state.host_ids.insert(url.to_owned(), Arc::clone(&value));
-                    value
-                }
-            };
-            let counts = hosts.entry(Arc::clone(&host_id)).or_default();
-            counts.0 += 1;
-            if let Some(reading) = state.readings.get(workers[idx].url()).filter(|r| {
-                wall >= r.observation.observed_at
-                    && wall - r.observation.observed_at <= MAX_AGE_SECS
-            }) {
-                counts.1 += 1;
-                fresh.push((
-                    idx,
-                    reading
-                        .observation
-                        .running
-                        .saturating_add(reading.observation.waiting)
-                        .saturating_add(reading.pending),
-                    reading.observation.kv_usage,
-                    reading.last_selected,
-                    host_id,
-                ));
-            }
-        }
-        let complete: HashSet<_> = hosts
+        // The router already owns an atomic reservation for every outstanding
+        // generation HTTP request. A census is never an admission prerequisite,
+        // and stale/missing reports cannot make a healthy backend unavailable.
+        let candidates: Vec<_> = healthy
             .iter()
-            .filter(|(_, (expected, seen))| expected == seen)
-            .map(|(host, _)| host.clone())
+            .map(|&idx| {
+                (
+                    idx,
+                    workers[idx].load() as u64,
+                    state
+                        .last_selected
+                        .get(workers[idx].url())
+                        .copied()
+                        .unwrap_or(0),
+                )
+            })
             .collect();
-        if complete.is_empty() || complete.len() * 10 < hosts.len() * 9 {
-            // Missing feedback cannot introduce a new blind placement. Existing
-            // sessions retain their known owner until fresh feedback returns.
-            let idx = owner?;
-            return self.reserve_locked(state, workers, idx, key, reserve, true, false, instant);
-        }
-        fresh.retain(|(_, _, _, _, host_id)| complete.contains(host_id));
-        if fresh.is_empty() {
-            return None;
-        }
-        let mut loads: Vec<_> = fresh.iter().map(|(_, load, _, _, _)| *load).collect();
+        let mut loads: Vec<_> = candidates.iter().map(|(_, load, _)| *load).collect();
         loads.sort_unstable();
         let median = (loads[(loads.len() - 1) / 2] as f64 + loads[loads.len() / 2] as f64) / 2.0;
         let keep = keep_affinity
             && owner.is_some_and(|idx| {
-                fresh.iter().any(|(i, load, _, _, _)| {
-                    *i == idx && (*load == 0 || (*load as f64) < self.spill_factor * median)
-                })
+                let load = workers[idx].load();
+                load == 0 || (load as f64) < self.spill_factor * median
             });
         let idx = if keep {
             owner.unwrap()
         } else {
-            fresh
+            candidates
                 .iter()
-                .min_by(|a, b| {
-                    a.1.cmp(&b.1)
-                        .then_with(|| a.2.total_cmp(&b.2))
-                        .then_with(|| a.3.cmp(&b.3))
-                })
+                .min_by_key(|(_, load, selected)| (*load, *selected))
                 .unwrap()
                 .0
         };
@@ -471,6 +453,9 @@ impl EngineLoadPolicy {
         let worker = workers[idx].url().to_owned();
         state.sequence = state.sequence.wrapping_add(1);
         let sequence = state.sequence;
+        if reserve && inference {
+            state.last_selected.insert(worker.clone(), sequence);
+        }
         let epoch = if let Some(reading) = state.readings.get_mut(&worker) {
             reading.last_selected = sequence;
             if reserve && inference {
@@ -590,22 +575,6 @@ impl LoadBalancingPolicy for EngineLoadPolicy {
     ) -> Result<usize, String> {
         self.update_at(snapshot, registered, wall_time())
     }
-    fn unselected_is_new_request(
-        &self,
-        text: Option<&str>,
-        headers: Option<&RequestHeaders>,
-    ) -> bool {
-        if abort_request(text) {
-            return false;
-        }
-        let key = headers
-            .and_then(hash_key::extract_hash_key_from_headers)
-            .or_else(|| hash_key::extract_hash_key_from_body(text));
-        let state = self.state.lock().unwrap();
-        key.as_ref()
-            .and_then(|key| state.sessions.get(key))
-            .map_or(true, |s| s.inflight == 0)
-    }
     fn release_session_owners(&self) -> usize {
         let mut state = self.state.lock().unwrap();
         for session in state.sessions.values_mut() {
@@ -645,6 +614,51 @@ mod tests {
     }
     fn headers() -> RequestHeaders {
         HashMap::from([("x-session-id".to_owned(), "episode".to_owned())])
+    }
+    #[test]
+    fn native_load_without_any_publication_balances_outstanding_requests() {
+        let p = EngineLoadPolicy::new();
+        let w = workers();
+        let now = Instant::now();
+        let a = p.choose(&w, None, None, true, now, 100.0).unwrap();
+        let b = p.choose(&w, None, None, true, now, 100.0).unwrap();
+        assert_ne!(a.0, b.0);
+        assert_eq!(w.iter().map(|w| w.load()).sum::<usize>(), 2);
+        drop(a);
+        drop(b);
+        assert!(w.iter().all(|w| w.load() == 0));
+    }
+    #[test]
+    fn native_load_ignores_stale_missing_and_conflicting_telemetry() {
+        let p = EngineLoadPolicy::new();
+        let w = workers();
+        publish(&p, &w, &[0, 9999], &[0.1, 0.9], 100.0);
+        let a = p
+            .choose(&w, None, None, true, Instant::now(), 100.0)
+            .unwrap();
+        let b = p
+            .choose(&w, None, None, true, Instant::now(), 1000.0)
+            .unwrap();
+        assert_ne!(a.0, b.0);
+        drop(a);
+        drop(b);
+    }
+    #[test]
+    fn native_load_counts_requests_not_retained_session_bindings() {
+        let p = EngineLoadPolicy::new();
+        let w = workers();
+        let h = headers();
+        let a = p
+            .choose(&w, None, Some(&h), true, Instant::now(), 100.0)
+            .unwrap();
+        let owner = a.0;
+        drop(a);
+        assert_eq!(p.state.lock().unwrap().sessions.len(), 1);
+        assert!(w.iter().all(|w| w.load() == 0));
+        let b = p
+            .choose(&w, None, Some(&h), true, Instant::now(), 9999.0)
+            .unwrap();
+        assert_eq!(b.0, owner);
     }
     #[test]
     fn addressed_expiry_is_exact_between_bounded_sweeps_and_inflight_never_expires() {
@@ -723,11 +737,10 @@ mod tests {
         .unwrap();
     }
     #[test]
-    fn reset_release_survives_overlap_abort_and_stale_retention() {
+    fn reset_release_survives_overlap_abort_until_next_idle_selection() {
         let p = EngineLoadPolicy::new();
         let w = workers();
         let h = headers();
-        publish(&p, &w, &[0, 0], &[0.2, 0.2], 100.0);
         let first = p
             .choose(
                 &w,
@@ -746,7 +759,7 @@ mod tests {
                 Some(&h),
                 true,
                 Instant::now(),
-                100.0,
+                1000.0,
             )
             .unwrap();
         assert_eq!(overlap.0, first.0);
@@ -758,9 +771,10 @@ mod tests {
                 Some(&h),
                 true,
                 Instant::now(),
-                100.0,
+                1000.0,
             )
             .unwrap();
+        assert_eq!(abort.0, first.0);
         drop(abort);
         assert!(p
             .state
@@ -771,25 +785,6 @@ mod tests {
             .all(|s| s.released));
         let original = first.0;
         drop(first);
-        let retained = p
-            .choose(
-                &w,
-                Some("generation"),
-                Some(&h),
-                true,
-                Instant::now(),
-                110.0,
-            )
-            .unwrap();
-        drop(retained);
-        assert!(p
-            .state
-            .lock()
-            .unwrap()
-            .sessions
-            .values()
-            .all(|s| s.released));
-        publish(&p, &w, &[0, 0], &[0.2, 0.2], 111.0);
         let next = p
             .choose(
                 &w,
@@ -797,10 +792,32 @@ mod tests {
                 Some(&h),
                 true,
                 Instant::now(),
-                111.0,
+                1000.0,
             )
             .unwrap();
         assert_ne!(next.0, original);
+        assert!(p
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .all(|s| !s.released));
+        let owner = next.0;
+        drop(next);
+        assert_eq!(
+            p.choose(
+                &w,
+                Some("generation"),
+                Some(&h),
+                true,
+                Instant::now(),
+                1000.0
+            )
+            .unwrap()
+            .0,
+            owner
+        );
     }
     #[test]
     fn omitted_observation_cannot_erase_monotonic_watermark() {
@@ -883,32 +900,27 @@ mod tests {
     }
 
     #[test]
-    fn actual_queue_precedes_kv_and_headerless_reservations_are_atomic() {
-        let p = EngineLoadPolicy::with_parameters(Duration::from_secs(900), 2.0);
+    fn own_outstanding_requests_precede_optional_queue_and_kv() {
+        let p = EngineLoadPolicy::new();
         let w = workers();
-        publish(&p, &w, &[100, 0], &[0.1, 0.9], 100.0);
+        publish(&p, &w, &[0, 9999], &[0.0, 1.0], 100.0);
+        let held = p.test_hold_requests(&w, w[0].url(), 10);
         let (idx, lease) = p
-            .choose(&w, None, None, true, Instant::now(), 100.0)
+            .choose(&w, None, None, true, Instant::now(), 1000.0)
             .unwrap();
         assert_eq!(idx, 1);
         drop(lease);
-        publish(&p, &w, &[0, 0], &[0.2, 0.2], 101.0);
+        drop(held);
         let a = p
-            .choose(&w, None, None, true, Instant::now(), 101.0)
+            .choose(&w, None, None, true, Instant::now(), 1000.0)
             .unwrap();
         let b = p
-            .choose(&w, None, None, true, Instant::now(), 101.0)
+            .choose(&w, None, None, true, Instant::now(), 1000.0)
             .unwrap();
         assert_ne!(a.0, b.0);
         drop(a);
         drop(b);
-        publish(&p, &w, &[1, 1], &[0.9, 0.1], 102.0);
-        assert_eq!(
-            p.choose(&w, None, None, false, Instant::now(), 102.0)
-                .unwrap()
-                .0,
-            1
-        );
+        assert!(w.iter().all(|w| w.load() == 0));
     }
     #[test]
     fn sticky_spill_waits_for_settlement_and_abort_never_moves() {
@@ -927,7 +939,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first.0, 0);
-        publish(&p, &w, &[100, 0], &[0.2, 0.2], 101.0);
+        let _held = p.test_hold_requests(&w, w[0].url(), 100);
         let abort = p
             .choose(
                 &w,
@@ -1081,13 +1093,13 @@ mod tests {
         );
     }
     #[test]
-    fn stale_quorum_holds_new_placement_and_rejects_bad_publication_atomically() {
+    fn stale_publication_never_blocks_and_bad_updates_remain_atomic() {
         let p = EngineLoadPolicy::new();
         let w = workers();
         publish(&p, &w, &[1, 2], &[0.1, 0.2], 100.0);
-        assert!(p
+        let a = p
             .choose(&w, None, None, true, Instant::now(), 107.0)
-            .is_none());
+            .unwrap();
         let bad = EngineObservation {
             worker_url: w[0].url().to_owned(),
             observed_at: 99.0,
@@ -1102,12 +1114,12 @@ mod tests {
                 100.0
             )
             .is_err());
-        assert_eq!(
-            p.choose(&w, None, None, true, Instant::now(), 100.0)
-                .unwrap()
-                .0,
-            0
-        );
+        let b = p
+            .choose(&w, None, None, true, Instant::now(), 1000.0)
+            .unwrap();
+        assert_ne!(a.0, b.0);
+        drop(a);
+        drop(b);
     }
     #[test]
     fn repeated_snapshot_does_not_erase_pending_and_old_leases_do_not_double_count() {
@@ -1134,7 +1146,7 @@ mod tests {
             .all(|r| r.pending == 0));
     }
     #[test]
-    fn heterogeneous_hosts_require_complete_fresh_host_coverage() {
+    fn heterogeneous_hosts_balance_without_complete_fresh_coverage() {
         let p = EngineLoadPolicy::new();
         let w: Vec<Arc<dyn Worker>> = (0..10)
             .map(|i| {
@@ -1148,38 +1160,28 @@ mod tests {
                 )) as Arc<dyn Worker>
             })
             .collect();
-        publish(
-            &p,
-            &w,
-            &[100, 100, 100, 100, 100, 100, 100, 100, 0, 0],
-            &[0.1; 10],
-            100.0,
-        );
-        assert!(
-            p.choose(&w, None, None, true, Instant::now(), 100.0)
-                .unwrap()
-                .0
-                >= 8
-        );
-        let rows = w
-            .iter()
-            .skip(1)
-            .map(|w| EngineObservation {
-                worker_url: w.url().into(),
-                observed_at: 101.0,
-                running: 0,
-                waiting: 0,
-                kv_usage: 0.1,
-            })
-            .collect();
         p.update_at(
-            EngineSnapshot { workers: rows },
-            &w.iter().map(|w| w.url().into()).collect::<Vec<_>>(),
-            101.0,
+            EngineSnapshot {
+                workers: vec![EngineObservation {
+                    worker_url: w[0].url().to_owned(),
+                    observed_at: 100.0,
+                    running: 9999,
+                    waiting: 9999,
+                    kv_usage: 1.0,
+                }],
+            },
+            &w.iter().map(|w| w.url().to_owned()).collect::<Vec<_>>(),
+            100.0,
         )
         .unwrap();
-        assert!(p
-            .choose(&w, None, None, true, Instant::now(), 101.0)
-            .is_none());
+        let leases: Vec<_> = (0..100)
+            .map(|_| {
+                p.choose(&w, None, None, true, Instant::now(), 1000.0)
+                    .unwrap()
+            })
+            .collect();
+        assert!(w.iter().all(|w| w.load() == 10));
+        drop(leases);
+        assert!(w.iter().all(|w| w.load() == 0));
     }
 }
