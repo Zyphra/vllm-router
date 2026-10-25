@@ -2616,14 +2616,16 @@ mod tests {
         .unwrap()
     }
 
-    async fn heavy_on(policy: &Arc<dyn LoadBalancingPolicy>, owner: &str) {
-        // Force a settled-owner spill using measured queue gauges, never token
-        // lengths or local worker-load counters.
-        let engine = policy
+    async fn heavy_on(
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        owner: &str,
+        workers: &[Arc<dyn Worker>],
+    ) -> Vec<crate::policies::SessionLease> {
+        policy
             .as_any()
             .downcast_ref::<crate::policies::EngineLoadPolicy>()
-            .unwrap();
-        engine.test_set_queue(owner, 100);
+            .unwrap()
+            .test_hold_requests(workers, owner, 100)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2650,7 +2652,7 @@ mod tests {
                 .await,
         )
         .await;
-        heavy_on(&policy, &owner).await;
+        let _load = heavy_on(&policy, &owner, &router.worker_registry.get_all()).await;
         let resetting = Arc::clone(&router);
         let resetter = tokio::spawn(async move {
             for _ in 0..100 {
@@ -2725,7 +2727,7 @@ mod tests {
                 .await,
         )
         .await;
-        heavy_on(&policy, &owner).await;
+        let _load = heavy_on(&policy, &owner, &router.worker_registry.get_all()).await;
         router.reset_session_placement().await;
         drop(generation);
         assert_ne!(
@@ -2756,7 +2758,7 @@ mod tests {
             .unwrap();
         let owner = worker.url().to_string();
         drop(lease);
-        heavy_on(&policy, &owner).await;
+        let _load = heavy_on(&policy, &owner, &router.worker_registry.get_all()).await;
         for (url, _, task) in &backends {
             if url == &owner {
                 task.abort();
@@ -2809,7 +2811,7 @@ mod tests {
                 .await,
         )
         .await;
-        heavy_on(&policy, &owner).await;
+        let _load = heavy_on(&policy, &owner, &router.worker_registry.get_all()).await;
         router.reset_session_placement().await;
         assert_eq!(
             response_text(
@@ -3104,7 +3106,12 @@ mod tests {
             StatusCode::OK
         );
         let owner = seen.lock().await[0].0.clone();
-        heavy_on(&router.policy_registry.get_default_policy(), &owner).await;
+        let _load = heavy_on(
+            &router.policy_registry.get_default_policy(),
+            &owner,
+            &router.worker_registry.get_all(),
+        )
+        .await;
         assert_eq!(
             app.clone().oneshot(send()).await.unwrap().status(),
             StatusCode::OK
