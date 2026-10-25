@@ -1,9 +1,10 @@
-//! Shared placement by router-owned outstanding HTTP requests; telemetry is optional.
+//! Shared placement by router-owned bound context bytes; telemetry is optional.
 use super::{get_healthy_worker_indices, hash_key, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -43,6 +44,8 @@ struct Session {
     inflight: u64,
     last_settled: Instant,
     released: bool,
+    context_bytes: u64,
+    context_revision: u64,
 }
 
 #[derive(Debug, Default)]
@@ -55,6 +58,36 @@ struct State {
     epoch: u64,
     sequence: u64,
     last_selected: HashMap<String, u64>,
+    context_bytes: HashMap<String, u128>,
+    context_expiry: BinaryHeap<Reverse<(Instant, u64, String)>>,
+}
+
+impl State {
+    fn replace_context(&mut self, worker: &str, old: u64, new: u64) {
+        let total = self.context_bytes.entry(worker.to_owned()).or_default();
+        *total = total.saturating_sub(u128::from(old)) + u128::from(new);
+    }
+
+    fn expire_contexts(&mut self, now: Instant) {
+        // A deadline queue avoids a full session scan on the request path.
+        // Old entries are harmless after another request or a weight reset.
+        while self
+            .context_expiry
+            .peek()
+            .is_some_and(|Reverse((deadline, _, _))| *deadline < now)
+        {
+            let Reverse((_, revision, key)) = self.context_expiry.pop().unwrap();
+            let expired = self.sessions.get_mut(&key).and_then(|session| {
+                (session.inflight == 0 && session.context_revision == revision).then(|| {
+                    let bytes = std::mem::take(&mut session.context_bytes);
+                    (session.worker.clone(), bytes)
+                })
+            });
+            if let Some((worker, bytes)) = expired {
+                self.replace_context(&worker, bytes, 0);
+            }
+        }
+    }
 }
 
 /// The response owns this reservation until EOF, failure, cancellation or drop.
@@ -65,17 +98,22 @@ pub struct SessionLease {
     worker: String,
     worker_handle: Arc<dyn Worker>,
     epoch: u64,
+    transient_bytes: u64,
+    idle: Duration,
 }
 
 impl Drop for SessionLease {
     fn drop(&mut self) {
         self.worker_handle.decrement_load();
         let mut state = self.state.lock().unwrap();
+        state.replace_context(&self.worker, self.transient_bytes, 0);
         if let Some(reading) = state.readings.get_mut(&self.worker) {
             if reading.epoch == self.epoch {
                 reading.pending = reading.pending.saturating_sub(1);
             }
         }
+        let mut released_context = None;
+        let mut expiry = None;
         if let Some(session) = self
             .key
             .as_ref()
@@ -84,7 +122,28 @@ impl Drop for SessionLease {
             session.inflight = session.inflight.saturating_sub(1);
             if session.inflight == 0 {
                 session.last_settled = Instant::now();
+                session.context_revision = session.context_revision.wrapping_add(1);
+                if session.released {
+                    released_context = Some((
+                        session.worker.clone(),
+                        std::mem::take(&mut session.context_bytes),
+                    ));
+                } else if session.context_bytes > 0 {
+                    expiry = session.last_settled.checked_add(self.idle).map(|deadline| {
+                        Reverse((
+                            deadline,
+                            session.context_revision,
+                            self.key.clone().unwrap(),
+                        ))
+                    });
+                }
             }
+        }
+        if let Some((worker, bytes)) = released_context {
+            state.replace_context(&worker, bytes, 0);
+        }
+        if let Some(expiry) = expiry {
+            state.context_expiry.push(expiry);
         }
     }
 }
@@ -154,6 +213,7 @@ impl EngineLoadPolicy {
                     true,
                     false,
                     Instant::now(),
+                    None,
                 )
                 .unwrap()
                 .1
@@ -175,6 +235,8 @@ impl EngineLoadPolicy {
                     inflight: 0,
                     last_settled: now,
                     released: false,
+                    context_bytes: 0,
+                    context_revision: 0,
                 },
             );
         }
@@ -335,9 +397,15 @@ impl EngineLoadPolicy {
             .and_then(hash_key::extract_hash_key_from_headers)
             .or_else(|| hash_key::extract_hash_key_from_body(text));
         let selected = {
+            let bytes = headers.and_then(|headers| {
+                headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.parse::<u64>().ok())
+            });
             let mut state = self.state.lock().unwrap();
             self.choose_locked(
-                &mut state, workers, &healthy, key, reserve, instant, wall, abort,
+                &mut state, workers, &healthy, key, reserve, instant, wall, abort, bytes,
             )
         };
         if let Some((idx, _)) = &selected {
@@ -358,7 +426,9 @@ impl EngineLoadPolicy {
         instant: Instant,
         _wall: f64,
         abort: bool,
+        bytes: Option<u64>,
     ) -> Option<(usize, Option<SessionLease>)> {
+        state.expire_contexts(instant);
         // Preserve the established abort-retention period. Only idle owners can
         // expire; after one idle period a generation loses affinity, while an
         // abort can still find its exact owner for four idle periods.
@@ -399,18 +469,36 @@ impl EngineLoadPolicy {
         // abort. Returning no route is safer than aborting an unrelated engine.
         if resident.is_some_and(|s| s.inflight > 0) || abort {
             let idx = owner?;
-            return self.reserve_locked(state, workers, idx, key, reserve, !abort, false, instant);
+            return self.reserve_locked(
+                state, workers, idx, key, reserve, !abort, false, instant, bytes,
+            );
         }
 
-        // The router already owns an atomic reservation for every outstanding
-        // generation HTTP request. A census is never an admission prerequisite,
-        // and stale/missing reports cannot make a healthy backend unavailable.
+        // The latest declared body size belongs to the bound logical session,
+        // including its idle affinity window, rather than just this HTTP lease.
+        // Preview an owner's growth before deciding whether it should spill.
+        let old_bytes = resident.map_or(0, |session| session.context_bytes);
+        let latest_bytes = bytes.unwrap_or(old_bytes);
         let candidates: Vec<_> = healthy
             .iter()
             .map(|&idx| {
                 (
                     idx,
-                    workers[idx].load() as u64,
+                    state
+                        .context_bytes
+                        .get(workers[idx].url())
+                        .copied()
+                        .unwrap_or(0)
+                        - if owner == Some(idx) {
+                            u128::from(old_bytes)
+                        } else {
+                            0
+                        }
+                        + if owner == Some(idx) {
+                            u128::from(latest_bytes)
+                        } else {
+                            0
+                        },
                     state
                         .last_selected
                         .get(workers[idx].url())
@@ -424,8 +512,17 @@ impl EngineLoadPolicy {
         let median = (loads[(loads.len() - 1) / 2] as f64 + loads[loads.len() / 2] as f64) / 2.0;
         let keep = keep_affinity
             && owner.is_some_and(|idx| {
-                let load = workers[idx].load();
-                load == 0 || (load as f64) < self.spill_factor * median
+                let load = candidates.iter().find(|(i, _, _)| *i == idx).unwrap().1;
+                let best_destination = candidates
+                    .iter()
+                    .filter(|(i, _, _)| *i != idx)
+                    .map(|(_, load, _)| *load + u128::from(latest_bytes))
+                    .min();
+                load == 0
+                    || (load as f64) < self.spill_factor * median
+                    // Moving a sole context to an idle engine cannot reduce its
+                    // weight; preserve affinity when relocation cannot help.
+                    || (latest_bytes > 0 && best_destination.is_none_or(|best| best >= load))
             });
         let idx = if keep {
             owner.unwrap()
@@ -436,7 +533,9 @@ impl EngineLoadPolicy {
                 .unwrap()
                 .0
         };
-        self.reserve_locked(state, workers, idx, key, reserve, true, true, instant)
+        self.reserve_locked(
+            state, workers, idx, key, reserve, true, true, instant, bytes,
+        )
     }
 
     fn reserve_locked(
@@ -449,6 +548,7 @@ impl EngineLoadPolicy {
         inference: bool,
         placement_selected: bool,
         instant: Instant,
+        bytes: Option<u64>,
     ) -> Option<(usize, Option<SessionLease>)> {
         let worker = workers[idx].url().to_owned();
         state.sequence = state.sequence.wrapping_add(1);
@@ -469,17 +569,28 @@ impl EngineLoadPolicy {
         } else {
             0
         };
+        let mut context_change = None;
         if let Some(key) = &key {
             let session = state.sessions.entry(key.clone()).or_insert(Session {
                 worker: worker.clone(),
                 inflight: 0,
                 last_settled: instant,
                 released: false,
+                context_bytes: 0,
+                context_revision: 0,
             });
             assert!(
                 session.inflight == 0 || session.worker == worker,
                 "cannot move an outstanding session"
             );
+            if inference && (reserve || session.worker != worker) {
+                let previous = (session.worker.clone(), session.context_bytes);
+                if reserve {
+                    session.context_bytes = bytes.unwrap_or(session.context_bytes);
+                    session.context_revision = session.context_revision.wrapping_add(1);
+                }
+                context_change = Some((previous, session.context_bytes));
+            }
             session.worker = worker.clone();
             if placement_selected {
                 session.released = false;
@@ -488,6 +599,24 @@ impl EngineLoadPolicy {
                 session.inflight += 1;
             }
         }
+        if let Some(((previous, old), new)) = context_change {
+            state.replace_context(&previous, old, 0);
+            state.replace_context(&worker, 0, new);
+        }
+        // Unknown Content-Length keeps the existing live-request fallback.
+        // Headerless requests have no retained affinity and live only to EOF.
+        let transient_bytes = if reserve && inference {
+            if key.is_none() {
+                bytes.unwrap_or(1).max(1)
+            } else if bytes.is_none_or(|bytes| bytes == 0) {
+                1
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        state.replace_context(&worker, 0, transient_bytes);
         if reserve {
             workers[idx].increment_load();
         }
@@ -497,6 +626,8 @@ impl EngineLoadPolicy {
             worker,
             worker_handle: Arc::clone(&workers[idx]),
             epoch,
+            transient_bytes,
+            idle: self.idle,
         });
         Some((idx, lease))
     }
@@ -577,8 +708,19 @@ impl LoadBalancingPolicy for EngineLoadPolicy {
     }
     fn release_session_owners(&self) -> usize {
         let mut state = self.state.lock().unwrap();
+        let mut idle_contexts = Vec::new();
         for session in state.sessions.values_mut() {
             session.released = true;
+            if session.inflight == 0 {
+                idle_contexts.push((
+                    session.worker.clone(),
+                    std::mem::take(&mut session.context_bytes),
+                ));
+                session.context_revision = session.context_revision.wrapping_add(1);
+            }
+        }
+        for (worker, bytes) in idle_contexts {
+            state.replace_context(&worker, bytes, 0);
         }
         state.sessions.len()
     }
@@ -682,6 +824,8 @@ mod tests {
                         inflight,
                         last_settled: now - Duration::from_secs(age),
                         released: false,
+                        context_bytes: 0,
+                        context_revision: 0,
                     },
                 );
             }
@@ -1183,5 +1327,273 @@ mod tests {
         assert!(w.iter().all(|w| w.load() == 10));
         drop(leases);
         assert!(w.iter().all(|w| w.load() == 0));
+    }
+
+    fn sized_headers(key: &str, bytes: u64) -> RequestHeaders {
+        HashMap::from([
+            ("x-session-id".into(), key.into()),
+            ("content-length".into(), bytes.to_string()),
+        ])
+    }
+
+    fn bound_total(p: &EngineLoadPolicy) -> u128 {
+        p.state.lock().unwrap().context_bytes.values().sum()
+    }
+
+    #[test]
+    fn context_is_retained_after_eof_and_replaced_by_the_latest_request() {
+        let p = EngineLoadPolicy::new();
+        let w = workers();
+        let first = p
+            .select_generation_worker_with_lease(&w, None, Some(&sized_headers("s", 10)))
+            .unwrap();
+        let overlap = p
+            .select_generation_worker_with_lease(&w, None, Some(&sized_headers("s", 100_000)))
+            .unwrap();
+        assert_eq!(first.0, overlap.0);
+        assert_eq!(bound_total(&p), 100_000);
+        drop(first);
+        assert_eq!(bound_total(&p), 100_000);
+        drop(overlap);
+        assert!(w.iter().all(|w| w.load() == 0));
+        assert_eq!(bound_total(&p), 100_000);
+        let shorter = p
+            .select_generation_worker_with_lease(&w, None, Some(&sized_headers("s", 30)))
+            .unwrap();
+        assert_eq!(bound_total(&p), 30);
+        drop(shorter);
+        assert_eq!(bound_total(&p), 30);
+    }
+
+    #[test]
+    fn a_sole_context_does_not_move_when_relocation_cannot_reduce_weight() {
+        let p = EngineLoadPolicy::new();
+        let w = workers();
+        let mut owner = None;
+        for size in [16, 1024, 100_000, 500_000] {
+            let request = p
+                .select_generation_worker_with_lease(&w, None, Some(&sized_headers("s", size)))
+                .unwrap();
+            assert_eq!(*owner.get_or_insert(request.0), request.0);
+            drop(request);
+            assert_eq!(bound_total(&p), u128::from(size));
+        }
+    }
+
+    #[test]
+    fn idle_context_deadline_expires_before_the_abort_owner_tombstone() {
+        let p = EngineLoadPolicy::with_parameters(Duration::from_secs(10), 2.0);
+        let w = workers();
+        drop(
+            p.select_generation_worker_with_lease(&w, None, Some(&sized_headers("s", 1000)))
+                .unwrap(),
+        );
+        p.choose(
+            &w,
+            None,
+            None,
+            false,
+            Instant::now() + Duration::from_secs(11),
+            0.0,
+        );
+        assert_eq!(bound_total(&p), 0);
+        assert!(p
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key("header:x-session-id:s"));
+        let active = p
+            .select_generation_worker_with_lease(&w, None, Some(&sized_headers("active", 2000)))
+            .unwrap();
+        p.choose(
+            &w,
+            None,
+            None,
+            false,
+            Instant::now() + Duration::from_secs(100),
+            0.0,
+        );
+        assert_eq!(bound_total(&p), 2000);
+        drop(active);
+    }
+
+    #[test]
+    fn reset_drops_idle_weights_and_retains_active_weights_until_settled() {
+        let p = EngineLoadPolicy::new();
+        let w = workers();
+        drop(
+            p.select_generation_worker_with_lease(&w, None, Some(&sized_headers("idle", 1000)))
+                .unwrap(),
+        );
+        let active = p
+            .select_generation_worker_with_lease(&w, None, Some(&sized_headers("active", 2000)))
+            .unwrap();
+        p.release_session_owners();
+        assert_eq!(bound_total(&p), 2000);
+        let overlap = p
+            .select_generation_worker_with_lease(&w, None, Some(&sized_headers("active", 3000)))
+            .unwrap();
+        assert_eq!(active.0, overlap.0);
+        drop(overlap);
+        assert_eq!(bound_total(&p), 3000);
+        drop(active);
+        assert_eq!(bound_total(&p), 0);
+    }
+
+    #[test]
+    fn abort_body_length_never_replaces_the_generation_context() {
+        let p = EngineLoadPolicy::new();
+        let w = workers();
+        let request = p
+            .select_generation_worker_with_lease(&w, None, Some(&sized_headers("s", 1000)))
+            .unwrap();
+        let owner = request.0;
+        drop(request);
+        let abort = p
+            .select_control_worker_with_lease(
+                &w,
+                Some(r#"{"request_id":"r"}"#),
+                Some(&sized_headers("s", 900_000)),
+            )
+            .unwrap();
+        assert_eq!(abort.0, owner);
+        drop(abort);
+        assert_eq!(bound_total(&p), 1000);
+    }
+
+    #[test]
+    fn missing_invalid_and_unkeyed_lengths_use_finite_live_request_fallback() {
+        let p = EngineLoadPolicy::new();
+        let w = workers();
+        for value in ["bad", "-1", "18446744073709551616", "0"] {
+            let h = HashMap::from([("content-length".into(), value.into())]);
+            let request = p
+                .select_generation_worker_with_lease(&w, None, Some(&h))
+                .unwrap();
+            assert_eq!(bound_total(&p), 1);
+            drop(request);
+            assert_eq!(bound_total(&p), 0);
+        }
+        let h = HashMap::from([("Content-Length".into(), "12345".into())]);
+        let request = p
+            .select_generation_worker_with_lease(&w, None, Some(&h))
+            .unwrap();
+        assert_eq!(bound_total(&p), 12345);
+        drop(request);
+        assert_eq!(bound_total(&p), 0);
+    }
+
+    #[test]
+    fn stale_idle_deadline_cannot_remove_a_newer_turns_context() {
+        let p = EngineLoadPolicy::with_parameters(Duration::from_secs(10), 2.0);
+        let w = workers();
+        drop(
+            p.select_generation_worker_with_lease(&w, None, Some(&sized_headers("s", 1000)))
+                .unwrap(),
+        );
+        let first = p.state.lock().unwrap().context_expiry.peek().unwrap().0 .0;
+        drop(
+            p.select_generation_worker_with_lease(&w, None, Some(&sized_headers("s", 2000)))
+                .unwrap(),
+        );
+        p.choose(&w, None, None, false, first + Duration::from_nanos(1), 0.0);
+        assert_eq!(bound_total(&p), 2000);
+    }
+
+    #[test]
+    fn preview_rehoming_keeps_bound_weight_and_session_owner_consistent() {
+        let p = EngineLoadPolicy::new();
+        let w = workers();
+        let h = sized_headers("s", 1000);
+        let request = p
+            .select_generation_worker_with_lease(&w, None, Some(&h))
+            .unwrap();
+        let owner = request.0;
+        drop(request);
+        let held = p.test_hold_requests(&w, w[owner].url(), 10);
+        let next = p.select_worker_with_headers(&w, None, Some(&h)).unwrap();
+        assert_ne!(next, owner);
+        assert_eq!(bound_total(&p), 1010);
+        drop(
+            p.select_generation_worker_with_lease(&w, None, Some(&h))
+                .unwrap(),
+        );
+        drop(held);
+        assert_eq!(bound_total(&p), 1000);
+    }
+
+    #[test]
+    fn growing_native_sessions_balance_bound_context_after_each_growth_wave() {
+        let p = EngineLoadPolicy::new();
+        let w: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|rank| {
+                Arc::new(BasicWorker::new(
+                    format!("http://a:8000@{rank}"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        // The ledger is derived from actual selected destinations and request
+        // lengths, independently of the policy's accounting implementation.
+        let mut observed: HashMap<usize, (usize, u64)> = HashMap::new();
+        let mut hot = Vec::new();
+        for session in 0..64 {
+            let body = serde_json::to_vec(&serde_json::json!({"request_id":format!("{session:03}-initial"),"prompt_ids":vec![1_u32;16],"max_tokens":1})).unwrap();
+            let request = p
+                .select_generation_worker_with_lease(
+                    &w,
+                    None,
+                    Some(&sized_headers(
+                        &format!("growing-{session}"),
+                        body.len() as u64,
+                    )),
+                )
+                .unwrap();
+            if request.0 == 0 {
+                hot.push(session);
+            }
+            observed.insert(session, (request.0, body.len() as u64));
+            drop(request);
+        }
+        assert_eq!(hot, vec![0, 8, 16, 24, 32, 40, 48, 56]);
+        // Only the sessions initially assigned to engine0 grow. Request-count
+        // affinity leaves all those settled long contexts on that engine.
+        // The selector gets Content-Length, not the native token-id payload.
+        for tokens in [512, 4096, 100_001, 140_000] {
+            for &session in &hot {
+                let body = serde_json::to_vec(&serde_json::json!({"request_id":format!("{session:03}-{tokens}"),"prompt_ids":vec![1_u32;tokens],"max_tokens":1})).unwrap();
+                let request = p
+                    .select_generation_worker_with_lease(
+                        &w,
+                        None,
+                        Some(&sized_headers(
+                            &format!("growing-{session}"),
+                            body.len() as u64,
+                        )),
+                    )
+                    .unwrap();
+                observed.insert(session, (request.0, body.len() as u64));
+                drop(request);
+            }
+            let mut weights = vec![0_u128; w.len()];
+            for &(engine, bytes) in observed.values() {
+                weights[engine] += u128::from(bytes);
+            }
+            weights.sort_unstable();
+            let twice_median = weights[3] + weights[4];
+            assert!(
+                weights[7] <= twice_median,
+                "tokens={tokens}; weights={weights:?}"
+            );
+        }
+        assert!(w.iter().all(|worker| worker.load() == 0));
+        assert!(
+            observed
+                .values()
+                .map(|(_, bytes)| u128::from(*bytes))
+                .sum::<u128>()
+                > hot.len() as u128 * 200_000
+        );
     }
 }

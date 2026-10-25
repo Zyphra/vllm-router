@@ -208,7 +208,7 @@ The router supports multiple load balancing policies:
 |--------|-------------|------------------|----------|
 | `round_robin` | Sequential distribution across workers | No | General purpose, even distribution |
 | `random` | Uniform random selection | No | Simple deployments |
-| `engine_load` | Router-owned outstanding HTTP requests, safe soft affinity | Yes | Every wrapper router |
+| `engine_load` | Router-owned bound context bytes, safe soft affinity | Yes | Every wrapper router |
 | `power_of_two` | Picks least loaded of two random workers | No | Load-sensitive workloads |
 | `cache_aware` | Optimizes for prefix cache hits | Yes | Repeated prompts, few-shot |
 
@@ -281,14 +281,21 @@ This project is a fork of [SGLang Model Gateway](https://github.com/sgl-project/
 
 All wrapper HTTP routers use `--policy engine_load`: training rollout, judges,
 user simulation, evaluation and public serve. Placement uses the router's own
-outstanding generation HTTP-request counts, atomically reserved during selection
-and released by the existing response lease. Retained session bindings are not
-load. Equal loads use the least recently selected worker. Healthy workers remain
+sum of each bound session's latest HTTP `Content-Length`, retained while a
+generation is outstanding or within the 900-second idle affinity window. A new
+turn replaces its session's weight rather than adding another copy. This is a
+body-byte proxy for context, not a measurement of KV bytes or token count. Missing
+or invalid lengths use the existing live-request fallback; unkeyed requests are
+weighted only until their response settles. Equal loads use the least recently
+selected worker. Healthy workers remain
 eligible with missing, stale or never-published telemetry; no placement feed is
 required and no placement HTTP429 hold is emitted. Optional legacy observation
 POSTs remain accepted but do not control placement.
 
 Existing active owners and aborts retain their exact owner. Unavailable active
 owners fail closed with HTTP503; they are never moved to an unrelated backend.
-Existing soft affinity, idle expiry and settled-session spill semantics remain.
+Settled owners may spill at twice the pool median; relocation that cannot reduce
+their weight preserves affinity. Idle expiry and weight reset release retained
+context weights. Expiry uses a deadline queue rather than scanning all sessions
+on every request. An active owner stays bound until its final request settles.
 The capability ACK stays `placement=engine_load`, `atomic_select_and_lease=true`.
