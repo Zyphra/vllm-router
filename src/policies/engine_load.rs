@@ -1534,22 +1534,52 @@ mod tests {
                 )) as Arc<dyn Worker>
             })
             .collect();
-        // Real native token-id payloads grow past 100k tokens. The selector sees
-        // only their HTTP Content-Length, never parses or tokenizes the body.
-        for tokens in [16, 512, 4096, 100_001, 140_000] {
-            for session in 0..64 {
-                let body = serde_json::to_vec(&serde_json::json!({"request_id":format!("{session}-{tokens}"),"prompt_ids":vec![1_u32;tokens],"max_tokens":1})).unwrap();
-                let h = sized_headers(&format!("growing-{session}"), body.len() as u64);
-                drop(
-                    p.select_generation_worker_with_lease(&w, None, Some(&h))
-                        .unwrap(),
-                );
+        // The ledger is derived from actual selected destinations and request
+        // lengths, independently of the policy's accounting implementation.
+        let mut observed: HashMap<usize, (usize, u64)> = HashMap::new();
+        let mut hot = Vec::new();
+        for session in 0..64 {
+            let body = serde_json::to_vec(&serde_json::json!({"request_id":format!("{session:03}-initial"),"prompt_ids":vec![1_u32;16],"max_tokens":1})).unwrap();
+            let request = p
+                .select_generation_worker_with_lease(
+                    &w,
+                    None,
+                    Some(&sized_headers(
+                        &format!("growing-{session}"),
+                        body.len() as u64,
+                    )),
+                )
+                .unwrap();
+            if request.0 == 0 {
+                hot.push(session);
             }
-            let state = p.state.lock().unwrap();
-            let mut weights: Vec<_> = w
-                .iter()
-                .map(|worker| state.context_bytes.get(worker.url()).copied().unwrap_or(0))
-                .collect();
+            observed.insert(session, (request.0, body.len() as u64));
+            drop(request);
+        }
+        assert_eq!(hot, vec![0, 8, 16, 24, 32, 40, 48, 56]);
+        // Only the sessions initially assigned to engine0 grow. Request-count
+        // affinity leaves all those settled long contexts on that engine.
+        // The selector gets Content-Length, not the native token-id payload.
+        for tokens in [512, 4096, 100_001, 140_000] {
+            for &session in &hot {
+                let body = serde_json::to_vec(&serde_json::json!({"request_id":format!("{session:03}-{tokens}"),"prompt_ids":vec![1_u32;tokens],"max_tokens":1})).unwrap();
+                let request = p
+                    .select_generation_worker_with_lease(
+                        &w,
+                        None,
+                        Some(&sized_headers(
+                            &format!("growing-{session}"),
+                            body.len() as u64,
+                        )),
+                    )
+                    .unwrap();
+                observed.insert(session, (request.0, body.len() as u64));
+                drop(request);
+            }
+            let mut weights = vec![0_u128; w.len()];
+            for &(engine, bytes) in observed.values() {
+                weights[engine] += u128::from(bytes);
+            }
             weights.sort_unstable();
             let twice_median = weights[3] + weights[4];
             assert!(
@@ -1558,6 +1588,12 @@ mod tests {
             );
         }
         assert!(w.iter().all(|worker| worker.load() == 0));
-        assert!(bound_total(&p) > 10_000_000);
+        assert!(
+            observed
+                .values()
+                .map(|(_, bytes)| u128::from(*bytes))
+                .sum::<u128>()
+                > hot.len() as u128 * 200_000
+        );
     }
 }
