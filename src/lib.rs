@@ -76,6 +76,7 @@ struct Router {
     retry_backoff_multiplier: f32,
     retry_jitter_factor: f32,
     disable_retries: bool,
+    native_pre_admission_retries: u8,
     // Circuit breaker configuration
     cb_failure_threshold: u32,
     cb_success_threshold: u32,
@@ -211,6 +212,7 @@ impl Router {
                 window_duration_secs: self.cb_window_duration_secs,
             },
             disable_retries: self.disable_retries,
+            native_pre_admission_retries: self.native_pre_admission_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             health_check: config::HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
@@ -310,6 +312,7 @@ impl Router {
         // KV connector default (PD disaggregation)
         kv_connector = String::from("nixl"),
         pool_idle_timeout_secs = 4,
+        native_pre_admission_retries = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -373,6 +376,7 @@ impl Router {
         otlp_traces_endpoint: Option<String>,
         kv_connector: String,
         pool_idle_timeout_secs: u64,
+        native_pre_admission_retries: u8,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -418,6 +422,7 @@ impl Router {
             retry_backoff_multiplier,
             retry_jitter_factor,
             disable_retries,
+            native_pre_admission_retries,
             cb_failure_threshold,
             cb_success_threshold,
             cb_timeout_duration_secs,

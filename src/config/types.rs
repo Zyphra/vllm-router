@@ -60,6 +60,9 @@ pub struct RouterConfig {
     /// Disable retries (overrides retry.max_retries to 1 when true)
     #[serde(default)]
     pub disable_retries: bool,
+    /// Retry one proven pre-admission native generation failure on another healthy worker.
+    #[serde(default)]
+    pub native_pre_admission_retries: u8,
     /// Disable circuit breaker (overrides circuit_breaker.failure_threshold to u32::MAX when true)
     #[serde(default)]
     pub disable_circuit_breaker: bool,
@@ -468,6 +471,7 @@ impl Default for RouterConfig {
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
+            native_pre_admission_retries: 0,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
@@ -1039,6 +1043,7 @@ mod tests {
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
+            native_pre_admission_retries: 0,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
@@ -1105,6 +1110,7 @@ mod tests {
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
+            native_pre_admission_retries: 0,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
@@ -1167,6 +1173,7 @@ mod tests {
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
+            native_pre_admission_retries: 0,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
