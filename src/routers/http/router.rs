@@ -1755,35 +1755,6 @@ impl RouterTrait for Router {
         let (worker_idx, lease) = match selection {
             Some(idx) => idx,
             None => {
-                if policy.session_placement() == "engine_load"
-                    && path == "/verl/v1/generate"
-                    && policy.unselected_is_new_request(
-                        request_text.as_deref(),
-                        request_headers.as_ref(),
-                    )
-                {
-                    if let (Some(request_id), Some(session_id)) = (
-                        body.get("request_id").and_then(serde_json::Value::as_str),
-                        request_headers
-                            .as_ref()
-                            .and_then(|headers| headers.get("x-session-id")),
-                    ) {
-                        // No owner or physical request was admitted. The native
-                        // caller may retry this exact receipt within its deadline.
-                        return (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            Json(serde_json::json!({
-                                "router_admission": "engine-load-v1",
-                                "placement": "engine_load",
-                                "never_dispatched": true,
-                                "request_id": request_id,
-                                "session_id": session_id,
-                                "retry_after_s": 2,
-                            })),
-                        )
-                            .into_response();
-                    }
-                }
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Failed to select a worker".to_string(),

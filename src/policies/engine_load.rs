@@ -1,4 +1,4 @@
-//! Shared engine-load placement. Census gauges, never token estimates, own load.
+//! Shared placement by router-owned outstanding HTTP requests; telemetry is optional.
 use super::{get_healthy_worker_indices, hash_key, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
@@ -54,6 +54,7 @@ struct State {
     sessions: HashMap<String, Session>,
     epoch: u64,
     sequence: u64,
+    last_selected: HashMap<String, u64>,
 }
 
 /// The response owns this reservation until EOF, failure, cancellation or drop.
@@ -337,7 +338,7 @@ impl EngineLoadPolicy {
         key: Option<String>,
         reserve: bool,
         instant: Instant,
-        wall: f64,
+        _wall: f64,
         abort: bool,
     ) -> Option<(usize, Option<SessionLease>)> {
         // Preserve the established abort-retention period. Only idle owners can
@@ -383,76 +384,28 @@ impl EngineLoadPolicy {
             return self.reserve_locked(state, workers, idx, key, reserve, !abort, false, instant);
         }
 
-        let mut hosts: HashMap<Arc<str>, (usize, usize)> = HashMap::new();
-        let mut fresh = Vec::new();
-        for &idx in healthy {
-            let url = workers[idx].url();
-            let host_id = match state.host_ids.get(url) {
-                Some(value) => Arc::clone(value),
-                None => {
-                    // An immediately hot-added worker may precede its first
-                    // census; cache its identity once, without inventing load.
-                    let value: Arc<str> = Arc::from(host(url));
-                    state.host_ids.insert(url.to_owned(), Arc::clone(&value));
-                    value
-                }
-            };
-            let counts = hosts.entry(Arc::clone(&host_id)).or_default();
-            counts.0 += 1;
-            if let Some(reading) = state.readings.get(workers[idx].url()).filter(|r| {
-                wall >= r.observation.observed_at
-                    && wall - r.observation.observed_at <= MAX_AGE_SECS
-            }) {
-                counts.1 += 1;
-                fresh.push((
-                    idx,
-                    reading
-                        .observation
-                        .running
-                        .saturating_add(reading.observation.waiting)
-                        .saturating_add(reading.pending),
-                    reading.observation.kv_usage,
-                    reading.last_selected,
-                    host_id,
-                ));
-            }
-        }
-        let complete: HashSet<_> = hosts
+        // The router already owns an atomic reservation for every outstanding
+        // generation HTTP request. A census is never an admission prerequisite,
+        // and stale/missing reports cannot make a healthy backend unavailable.
+        let candidates: Vec<_> = healthy
             .iter()
-            .filter(|(_, (expected, seen))| expected == seen)
-            .map(|(host, _)| host.clone())
+            .map(|&idx| (
+                idx,
+                workers[idx].load() as u64,
+                state.last_selected.get(workers[idx].url()).copied().unwrap_or(0),
+            ))
             .collect();
-        if complete.is_empty() || complete.len() * 10 < hosts.len() * 9 {
-            // Missing feedback cannot introduce a new blind placement. Existing
-            // sessions retain their known owner until fresh feedback returns.
-            let idx = owner?;
-            return self.reserve_locked(state, workers, idx, key, reserve, true, false, instant);
-        }
-        fresh.retain(|(_, _, _, _, host_id)| complete.contains(host_id));
-        if fresh.is_empty() {
-            return None;
-        }
-        let mut loads: Vec<_> = fresh.iter().map(|(_, load, _, _, _)| *load).collect();
+        let mut loads: Vec<_> = candidates.iter().map(|(_, load, _)| *load).collect();
         loads.sort_unstable();
         let median = (loads[(loads.len() - 1) / 2] as f64 + loads[loads.len() / 2] as f64) / 2.0;
-        let keep = keep_affinity
-            && owner.is_some_and(|idx| {
-                fresh.iter().any(|(i, load, _, _, _)| {
-                    *i == idx && (*load == 0 || (*load as f64) < self.spill_factor * median)
-                })
-            });
+        let keep = keep_affinity && owner.is_some_and(|idx| {
+            let load = workers[idx].load();
+            load == 0 || (load as f64) < self.spill_factor * median
+        });
         let idx = if keep {
             owner.unwrap()
         } else {
-            fresh
-                .iter()
-                .min_by(|a, b| {
-                    a.1.cmp(&b.1)
-                        .then_with(|| a.2.total_cmp(&b.2))
-                        .then_with(|| a.3.cmp(&b.3))
-                })
-                .unwrap()
-                .0
+            candidates.iter().min_by_key(|(_, load, selected)| (*load, *selected)).unwrap().0
         };
         self.reserve_locked(state, workers, idx, key, reserve, true, true, instant)
     }
@@ -471,6 +424,9 @@ impl EngineLoadPolicy {
         let worker = workers[idx].url().to_owned();
         state.sequence = state.sequence.wrapping_add(1);
         let sequence = state.sequence;
+        if reserve && inference {
+            state.last_selected.insert(worker.clone(), sequence);
+        }
         let epoch = if let Some(reading) = state.readings.get_mut(&worker) {
             reading.last_selected = sequence;
             if reserve && inference {
@@ -645,6 +601,43 @@ mod tests {
     }
     fn headers() -> RequestHeaders {
         HashMap::from([("x-session-id".to_owned(), "episode".to_owned())])
+    }
+    #[test]
+    fn native_load_without_any_publication_balances_outstanding_requests() {
+        let p = EngineLoadPolicy::new();
+        let w = workers();
+        let now = Instant::now();
+        let a = p.choose(&w, None, None, true, now, 100.0).unwrap();
+        let b = p.choose(&w, None, None, true, now, 100.0).unwrap();
+        assert_ne!(a.0, b.0);
+        assert_eq!(w.iter().map(|w| w.load()).sum::<usize>(), 2);
+        drop(a);
+        drop(b);
+        assert!(w.iter().all(|w| w.load() == 0));
+    }
+    #[test]
+    fn native_load_ignores_stale_missing_and_conflicting_telemetry() {
+        let p = EngineLoadPolicy::new();
+        let w = workers();
+        publish(&p, &w, &[0, 9999], &[0.1, 0.9], 100.0);
+        let a = p.choose(&w, None, None, true, Instant::now(), 100.0).unwrap();
+        let b = p.choose(&w, None, None, true, Instant::now(), 1000.0).unwrap();
+        assert_ne!(a.0, b.0);
+        drop(a);
+        drop(b);
+    }
+    #[test]
+    fn native_load_counts_requests_not_retained_session_bindings() {
+        let p = EngineLoadPolicy::new();
+        let w = workers();
+        let h = headers();
+        let a = p.choose(&w, None, Some(&h), true, Instant::now(), 100.0).unwrap();
+        let owner = a.0;
+        drop(a);
+        assert_eq!(p.state.lock().unwrap().sessions.len(), 1);
+        assert!(w.iter().all(|w| w.load() == 0));
+        let b = p.choose(&w, None, Some(&h), true, Instant::now(), 9999.0).unwrap();
+        assert_eq!(b.0, owner);
     }
     #[test]
     fn addressed_expiry_is_exact_between_bounded_sweeps_and_inflight_never_expires() {
