@@ -20,6 +20,13 @@ use crate::metrics::RouterMetrics;
 /// Number of virtual nodes per physical worker (for better load distribution)
 pub const VIRTUAL_NODES_PER_WORKER: u32 = 160;
 
+/// Bounded-load factor c (> 1) from this variable enables consistent hashing with
+/// bounded loads: a key leaves its ring owner only while that worker has more than
+/// about c times the mean in-flight requests, and then sticks to the worker it got.
+pub const LOAD_FACTOR_ENV: &str = "VLLM_ROUTER_CONSISTENT_HASH_LOAD_FACTOR";
+/// Spill assignments kept for stickiness; the table is cleared when it grows past this.
+const MAX_SPILLED_KEYS: usize = 1 << 20;
+
 /// Consistent hashing policy
 ///
 /// Routes requests based on session ID or user ID using consistent hashing,
@@ -30,14 +37,62 @@ pub struct ConsistentHashPolicy {
     hash_ring: RwLock<BTreeMap<u64, String>>,
     /// Current set of workers (for detecting changes)
     current_workers: RwLock<Vec<String>>,
+    /// Bounded-load factor; None keeps plain consistent hashing.
+    load_factor: Option<f64>,
+    /// Keys moved off their ring owner by the load bound, and where they went.
+    spilled: dashmap::DashMap<String, String>,
 }
 
 impl ConsistentHashPolicy {
     pub fn new() -> Self {
+        let load_factor = std::env::var(LOAD_FACTOR_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok());
+        Self::with_load_factor(load_factor.filter(|c: &f64| c.is_finite() && *c > 1.0))
+    }
+
+    pub fn with_load_factor(load_factor: Option<f64>) -> Self {
         Self {
             hash_ring: RwLock::new(BTreeMap::new()),
             current_workers: RwLock::new(Vec::new()),
+            load_factor,
+            spilled: dashmap::DashMap::new(),
         }
+    }
+
+    /// Bounded-load choice for `key` whose ring owner is `owner`. A worker fits while
+    /// its in-flight count is below ceil(c * (total + 1) / n).
+    fn bounded_index(&self, workers: &[Arc<dyn Worker>], key: &str, owner: usize, c: f64) -> usize {
+        let total: usize = workers.iter().map(|w| w.load()).sum();
+        let bound = (c * (total + 1) as f64 / workers.len() as f64).ceil() as usize;
+        let fits = |i: usize| workers[i].is_healthy() && workers[i].load() < bound;
+        let index_of = |url: &str| workers.iter().position(|w| w.url() == url);
+        if let Some(i) = self.spilled.get(key).and_then(|url| index_of(url.as_str())) {
+            if fits(i) {
+                return i;
+            }
+        }
+        if fits(owner) {
+            self.spilled.remove(key);
+            return owner;
+        }
+        let hash = Self::fbi_hash(key);
+        let ring = self.hash_ring.read().unwrap();
+        let walk = ring
+            .range(hash..)
+            .chain(ring.range(..hash))
+            .map(|(_, url)| url);
+        for i in walk.filter_map(|url| index_of(url)) {
+            if fits(i) {
+                if self.spilled.len() >= MAX_SPILLED_KEYS {
+                    self.spilled.clear();
+                }
+                self.spilled
+                    .insert(key.to_string(), workers[i].url().to_string());
+                return i;
+            }
+        }
+        owner
     }
 
     /// MurmurHash64A implementation from Facebook's mcrouter/lib/fbi/hash.c
@@ -401,6 +456,11 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
             target_worker_url, dp_rank
         );
 
+        let selected_idx = match (selected_idx, self.load_factor) {
+            (Some(idx), Some(c)) => Some(self.bounded_index(workers, &hash_key, idx, c)),
+            (selected, _) => selected,
+        };
+
         match selected_idx {
             Some(idx) => {
                 // Verify the worker is healthy
@@ -550,5 +610,74 @@ mod tests {
         assert_eq!(idx1, idx2);
         assert_eq!(idx2, idx3);
         assert!(idx1.is_some());
+    }
+
+    fn bounded_fixture(n: usize) -> Vec<Arc<dyn Worker>> {
+        (0..n)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    fn pick(policy: &ConsistentHashPolicy, workers: &[Arc<dyn Worker>], session: &str) -> usize {
+        let headers = RequestHeaders::from([("x-session-id".to_string(), session.to_string())]);
+        policy
+            .select_worker_with_headers(workers, None, Some(&headers))
+            .unwrap()
+    }
+
+    #[test]
+    fn bounded_load_keeps_the_owner_until_it_exceeds_the_bound_then_sticks_to_the_spill() {
+        let workers = bounded_fixture(4);
+        let plain = ConsistentHashPolicy::with_load_factor(None);
+        let bounded = ConsistentHashPolicy::with_load_factor(Some(1.25));
+        let owner = pick(&plain, &workers, "s");
+        // Balanced load: the ring owner keeps the session.
+        for w in &workers {
+            w.increment_load();
+        }
+        assert_eq!(pick(&bounded, &workers, "s"), owner);
+        // The owner is hot (6 of 9 in flight, bound ceil(1.25 * 10 / 4) = 4): spill.
+        for _ in 0..5 {
+            workers[owner].increment_load();
+        }
+        let spill = pick(&bounded, &workers, "s");
+        assert_ne!(spill, owner);
+        assert_eq!(
+            pick(&plain, &workers, "s"),
+            owner,
+            "plain hashing ignores load"
+        );
+        // Once spilled the session stays on its new worker, even after the owner cools.
+        for _ in 0..5 {
+            workers[owner].decrement_load();
+        }
+        assert_eq!(pick(&bounded, &workers, "s"), spill);
+        // If the spill target becomes hot itself, the session returns to a fitting owner.
+        for _ in 0..6 {
+            workers[spill].increment_load();
+        }
+        assert_eq!(pick(&bounded, &workers, "s"), owner);
+        assert!(bounded.spilled.get("header:x-session-id:s").is_none());
+    }
+
+    #[test]
+    fn bounded_load_never_exceeds_the_bound_while_any_worker_fits() {
+        let workers = bounded_fixture(8);
+        let bounded = ConsistentHashPolicy::with_load_factor(Some(1.25));
+        // Every request stays in flight: the busiest worker stays within the bound.
+        for i in 0..400 {
+            let index = pick(&bounded, &workers, &format!("session-{i}"));
+            workers[index].increment_load();
+            let max = workers.iter().map(|w| w.load()).max().unwrap();
+            assert!(
+                max <= (1.25 * (i + 1) as f64 / 8.0).ceil() as usize,
+                "{max} at {i}"
+            );
+        }
     }
 }

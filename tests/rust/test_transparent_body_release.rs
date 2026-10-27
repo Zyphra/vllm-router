@@ -54,7 +54,10 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let moved = unsafe { System.realloc(pointer, layout, new_size) };
         if !moved.is_null() {
-            LIVE_BYTES.fetch_add(new_size as isize - layout.size() as isize, Ordering::Relaxed);
+            LIVE_BYTES.fetch_add(
+                new_size as isize - layout.size() as isize,
+                Ordering::Relaxed,
+            );
         }
         moved
     }
