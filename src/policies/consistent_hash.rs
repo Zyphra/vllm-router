@@ -31,6 +31,9 @@ pub const MOVE_FACTOR_ENV: &str = "VLLM_ROUTER_CONSISTENT_HASH_MOVE_FACTOR";
 /// Known sessions kept; past this, entries idle longer than SESSION_TTL are dropped.
 const MAX_SESSIONS: usize = 1 << 20;
 const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
+/// A worker with fewer requests in flight is never hot enough to move a known
+/// session; at low fleet load this keeps a session and its abort on one worker.
+const MIN_MOVE_LOAD: usize = 64;
 
 /// Consistent hashing policy
 ///
@@ -82,7 +85,8 @@ impl ConsistentHashPolicy {
         let index_of = |url: &str| workers.iter().position(|w| w.url() == url);
         let now = std::time::Instant::now();
         if let Some(mut known) = self.sessions.get_mut(key) {
-            if let Some(i) = index_of(&known.0).filter(|&i| fits(i, moved)) {
+            let stays = |i: usize| fits(i, moved) || workers[i].load() < MIN_MOVE_LOAD;
+            if let Some(i) = index_of(&known.0).filter(|&i| workers[i].is_healthy() && stays(i)) {
                 known.1 = now;
                 return i;
             }
@@ -646,36 +650,39 @@ mod tests {
     #[test]
     fn bounded_load_places_new_sessions_by_load_and_moves_known_ones_only_past_the_move_factor() {
         let workers = bounded_fixture(4);
+        let add = |i: usize, n: usize| (0..n).for_each(|_| workers[i].increment_load());
+        let sub = |i: usize, n: usize| (0..n).for_each(|_| workers[i].decrement_load());
         let plain = ConsistentHashPolicy::with_load_factor(None);
         let bounded = ConsistentHashPolicy::with_load_factor(Some((1.25, 2.0)));
         let owner = pick(&plain, &workers, "s");
-        // A hot owner (5 of 8 in flight, new bound ceil(1.25 * 9 / 4) = 3) does not get
-        // a new session; plain hashing ignores load.
-        for w in &workers {
-            w.increment_load();
-        }
-        for _ in 0..4 {
-            workers[owner].increment_load();
-        }
+        // A hot owner (100 of 160 in flight, new bound ceil(1.25 * 161 / 4) = 51) does
+        // not get a new session; plain hashing ignores load.
+        (0..4).for_each(|i| add(i, 20));
+        add(owner, 80);
         let placed = pick(&bounded, &workers, "s");
         assert_ne!(placed, owner);
         assert_eq!(pick(&plain, &workers, "s"), owner);
-        // Known: it stays while its worker is under 2x the mean (3 of 6 in flight, move
-        // bound ceil(2 * 7 / 4) = 4), even though its cooled owner would now fit.
-        for _ in 0..4 {
-            workers[owner].decrement_load();
-        }
-        for _ in 0..2 {
-            workers[placed].increment_load();
-        }
+        // Known: it stays while its worker is under 2x the mean (60 of 120, move bound
+        // 61), even though its cooled owner would now fit.
+        sub(owner, 80);
+        add(placed, 40);
         assert_eq!(pick(&bounded, &workers, "s"), placed);
-        // Past the move factor (5 of 8, bound 5) it is placed again: its owner fits.
-        for _ in 0..2 {
-            workers[placed].increment_load();
-        }
+        // Past the move factor (100 of 160, bound 81) it is placed again: its owner fits.
+        add(placed, 40);
         assert_eq!(pick(&bounded, &workers, "s"), owner);
         let known = bounded.sessions.get("header:x-session-id:s").unwrap();
         assert_eq!(known.0, workers[owner].url());
+    }
+
+    #[test]
+    fn bounded_load_keeps_a_known_session_on_a_lightly_loaded_worker() {
+        // One generate in flight on an otherwise idle fleet is "past 2x the mean";
+        // its abort must still reach the worker holding it.
+        let workers = bounded_fixture(16);
+        let bounded = ConsistentHashPolicy::with_load_factor(Some((1.15, 2.0)));
+        let first = pick(&bounded, &workers, "s");
+        workers[first].increment_load();
+        assert_eq!(pick(&bounded, &workers, "s"), first);
     }
 
     #[test]
