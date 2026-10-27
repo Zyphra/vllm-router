@@ -2819,6 +2819,10 @@ impl RouterTrait for Router {
         if !body.is_null() {
             request_builder = request_builder.json(&body);
         }
+        // The builder owns the serialized bytes. Release the parsed body and its
+        // text copy so they do not stay resident while the worker generates.
+        drop(body);
+        drop(request_text);
 
         // Add authorization if configured
         if self.epd.is_some() {
