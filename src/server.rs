@@ -146,6 +146,10 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
         }
     };
 
+    // The parsed body owns the request; the raw bytes must not stay resident
+    // while the worker generates.
+    drop(body_bytes);
+
     // Route through transparent proxy
     state
         .router

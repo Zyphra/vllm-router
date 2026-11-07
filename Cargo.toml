@@ -248,6 +248,10 @@ name = "test_chat_template_loading"
 path = "tests/rust/test_chat_template_loading.rs"
 
 [[test]]
+name = "test_chat_tool_strict"
+path = "tests/rust/test_chat_tool_strict.rs"
+
+[[test]]
 name = "test_consistent_hash_policy"
 path = "tests/rust/test_consistent_hash_policy.rs"
 
@@ -270,6 +274,10 @@ path = "tests/rust/test_pd_routing.rs"
 [[test]]
 name = "test_prompt_input"
 path = "tests/rust/test_prompt_input.rs"
+
+[[test]]
+name = "test_transparent_body_release"
+path = "tests/rust/test_transparent_body_release.rs"
 
 [[test]]
 name = "test_transparent_proxy_routing"

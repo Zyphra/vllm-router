@@ -20,6 +20,25 @@ use crate::metrics::RouterMetrics;
 /// Number of virtual nodes per physical worker (for better load distribution)
 pub const VIRTUAL_NODES_PER_WORKER: u32 = 160;
 
+/// Bounded-load factor c (> 1) from this variable enables session placement with
+/// bounded loads: a session the router has not seen goes to its ring owner unless
+/// that worker holds more than about c times the mean in-flight requests, in which
+/// case it walks the ring to the first worker under that bound.
+pub const LOAD_FACTOR_ENV: &str = "VLLM_ROUTER_CONSISTENT_HASH_LOAD_FACTOR";
+/// A known session keeps its worker until that worker exceeds this multiple of the
+/// mean in-flight requests (default 2); it is then placed again as a new session.
+pub const MOVE_FACTOR_ENV: &str = "VLLM_ROUTER_CONSISTENT_HASH_MOVE_FACTOR";
+/// Sequences one engine runs at once (its `max_num_seqs`). The in-flight floor below
+/// which a worker never moves a known session is the lower of this and 64, so a
+/// saturated engine of a small cap can shed sessions; unset keeps the floor at 64.
+pub const ENGINE_CAPACITY_ENV: &str = "VLLM_ROUTER_CONSISTENT_HASH_ENGINE_CAPACITY";
+/// Known sessions kept; past this, entries idle longer than SESSION_TTL are dropped.
+const MAX_SESSIONS: usize = 1 << 20;
+const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
+/// A worker with fewer requests in flight is never hot enough to move a known
+/// session; at low fleet load this keeps a session and its abort on one worker.
+const DEFAULT_MIN_MOVE_LOAD: usize = 64;
+
 /// Consistent hashing policy
 ///
 /// Routes requests based on session ID or user ID using consistent hashing,
@@ -30,14 +49,88 @@ pub struct ConsistentHashPolicy {
     hash_ring: RwLock<BTreeMap<u64, String>>,
     /// Current set of workers (for detecting changes)
     current_workers: RwLock<Vec<String>>,
+    /// Placement and move factors; None keeps plain consistent hashing.
+    load_factor: Option<(f64, f64)>,
+    /// In-flight floor below which a known session is never moved.
+    min_move_load: usize,
+    /// Known sessions: worker URL and last use.
+    sessions: dashmap::DashMap<String, (String, std::time::Instant)>,
 }
 
 impl ConsistentHashPolicy {
     pub fn new() -> Self {
+        let factor = |name: &str| {
+            let value = std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok());
+            value.filter(|c| c.is_finite() && *c > 1.0)
+        };
+        let moved = factor(MOVE_FACTOR_ENV).unwrap_or(2.0);
+        let policy = Self::with_load_factor(factor(LOAD_FACTOR_ENV).map(|c| (c, moved.max(c))));
+        match std::env::var(ENGINE_CAPACITY_ENV)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+        {
+            Some(capacity) => policy.with_engine_capacity(capacity),
+            None => policy,
+        }
+    }
+
+    /// Cap the move floor at the engine's sequence capacity.
+    pub fn with_engine_capacity(mut self, capacity: usize) -> Self {
+        self.min_move_load = capacity.min(DEFAULT_MIN_MOVE_LOAD);
+        self
+    }
+
+    pub fn with_load_factor(load_factor: Option<(f64, f64)>) -> Self {
         Self {
             hash_ring: RwLock::new(BTreeMap::new()),
             current_workers: RwLock::new(Vec::new()),
+            load_factor,
+            min_move_load: DEFAULT_MIN_MOVE_LOAD,
+            sessions: dashmap::DashMap::new(),
         }
+    }
+
+    /// Bounded-load choice for `key` whose ring owner is `owner`: a known session
+    /// stays below `moved` times the mean in-flight load, a new one is placed below `c`.
+    fn bounded_index(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        key: &str,
+        owner: usize,
+        (c, moved): (f64, f64),
+    ) -> usize {
+        let total: usize = workers.iter().map(|w| w.load()).sum();
+        let bound = |f: f64| (f * (total + 1) as f64 / workers.len() as f64).ceil() as usize;
+        let fits = |i: usize, f: f64| workers[i].is_healthy() && workers[i].load() < bound(f);
+        let index_of = |url: &str| workers.iter().position(|w| w.url() == url);
+        let now = std::time::Instant::now();
+        if let Some(mut known) = self.sessions.get_mut(key) {
+            let stays = |i: usize| fits(i, moved) || workers[i].load() < self.min_move_load;
+            if let Some(i) = index_of(&known.0).filter(|&i| workers[i].is_healthy() && stays(i)) {
+                known.1 = now;
+                return i;
+            }
+        }
+        let hash = Self::fbi_hash(key);
+        let chosen = {
+            let ring = self.hash_ring.read().unwrap();
+            let walk = ring.range(hash..).chain(ring.range(..hash));
+            std::iter::once(owner)
+                .chain(walk.filter_map(|(_, url)| index_of(url)))
+                .find(|&i| fits(i, c))
+                .unwrap_or(owner)
+        };
+        if self.sessions.len() >= MAX_SESSIONS {
+            self.sessions
+                .retain(|_, (_, seen)| now.duration_since(*seen) < SESSION_TTL);
+            if self.sessions.len() >= MAX_SESSIONS {
+                self.sessions.clear();
+            }
+        }
+        let url = workers[chosen].url().to_string();
+        self.sessions.insert(key.to_string(), (url, now));
+        chosen
     }
 
     /// MurmurHash64A implementation from Facebook's mcrouter/lib/fbi/hash.c
@@ -401,6 +494,11 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
             target_worker_url, dp_rank
         );
 
+        let selected_idx = match (selected_idx, self.load_factor) {
+            (Some(idx), Some(c)) => Some(self.bounded_index(workers, &hash_key, idx, c)),
+            (selected, _) => selected,
+        };
+
         match selected_idx {
             Some(idx) => {
                 // Verify the worker is healthy
@@ -550,5 +648,100 @@ mod tests {
         assert_eq!(idx1, idx2);
         assert_eq!(idx2, idx3);
         assert!(idx1.is_some());
+    }
+
+    fn bounded_fixture(n: usize) -> Vec<Arc<dyn Worker>> {
+        (0..n)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    fn pick(policy: &ConsistentHashPolicy, workers: &[Arc<dyn Worker>], session: &str) -> usize {
+        let headers = RequestHeaders::from([("x-session-id".to_string(), session.to_string())]);
+        policy
+            .select_worker_with_headers(workers, None, Some(&headers))
+            .unwrap()
+    }
+
+    #[test]
+    fn bounded_load_places_new_sessions_by_load_and_moves_known_ones_only_past_the_move_factor() {
+        let workers = bounded_fixture(4);
+        let add = |i: usize, n: usize| (0..n).for_each(|_| workers[i].increment_load());
+        let sub = |i: usize, n: usize| (0..n).for_each(|_| workers[i].decrement_load());
+        let plain = ConsistentHashPolicy::with_load_factor(None);
+        let bounded = ConsistentHashPolicy::with_load_factor(Some((1.25, 2.0)));
+        let owner = pick(&plain, &workers, "s");
+        // A hot owner (100 of 160 in flight, new bound ceil(1.25 * 161 / 4) = 51) does
+        // not get a new session; plain hashing ignores load.
+        (0..4).for_each(|i| add(i, 20));
+        add(owner, 80);
+        let placed = pick(&bounded, &workers, "s");
+        assert_ne!(placed, owner);
+        assert_eq!(pick(&plain, &workers, "s"), owner);
+        // Known: it stays while its worker is under 2x the mean (60 of 120, move bound
+        // 61), even though its cooled owner would now fit.
+        sub(owner, 80);
+        add(placed, 40);
+        assert_eq!(pick(&bounded, &workers, "s"), placed);
+        // Past the move factor (100 of 160, bound 81) it is placed again: its owner fits.
+        add(placed, 40);
+        assert_eq!(pick(&bounded, &workers, "s"), owner);
+        let known = bounded.sessions.get("header:x-session-id:s").unwrap();
+        assert_eq!(known.0, workers[owner].url());
+    }
+
+    #[test]
+    fn bounded_load_keeps_a_known_session_on_a_lightly_loaded_worker() {
+        // One generate in flight on an otherwise idle fleet is "past 2x the mean";
+        // its abort must still reach the worker holding it.
+        let workers = bounded_fixture(16);
+        let bounded = ConsistentHashPolicy::with_load_factor(Some((1.15, 2.0)));
+        let first = pick(&bounded, &workers, "s");
+        workers[first].increment_load();
+        assert_eq!(pick(&bounded, &workers, "s"), first);
+    }
+
+    #[test]
+    fn bounded_load_moves_a_known_session_off_a_saturated_worker_below_the_default_floor() {
+        // Engines capped at 24 sequences never reach the default floor of 64, so the
+        // move factor must still fire once a worker holds a full batch of 24.
+        let workers = bounded_fixture(8);
+        let capped = || ConsistentHashPolicy::with_load_factor(Some((1.15, 2.0)));
+        let default_floor = capped();
+        let cap_floor = capped().with_engine_capacity(24);
+        // A capacity above the default leaves the floor at 64.
+        assert_eq!(capped().with_engine_capacity(72).min_move_load, 64);
+        let first = pick(&default_floor, &workers, "s");
+        assert_eq!(pick(&cap_floor, &workers, "s"), first);
+        // The worker holds 23 of 24 sequences and is over the 2x move bound (ceil(2 *
+        // 25 / 8) = 7): still below the cap, so the session stays.
+        (0..23).for_each(|_| workers[first].increment_load());
+        assert_eq!(pick(&cap_floor, &workers, "s"), first);
+        // At 24 it is saturated: the session is placed again, off the hot worker.
+        workers[first].increment_load();
+        assert_ne!(pick(&cap_floor, &workers, "s"), first);
+        // The default floor keeps it there; 24 in flight is below 64.
+        assert_eq!(pick(&default_floor, &workers, "s"), first);
+    }
+
+    #[test]
+    fn bounded_load_never_exceeds_the_bound_while_any_worker_fits() {
+        let workers = bounded_fixture(8);
+        let bounded = ConsistentHashPolicy::with_load_factor(Some((1.25, 2.0)));
+        // Every request stays in flight: the busiest worker stays within the bound.
+        for i in 0..400 {
+            let index = pick(&bounded, &workers, &format!("session-{i}"));
+            workers[index].increment_load();
+            let max = workers.iter().map(|w| w.load()).max().unwrap();
+            assert!(
+                max <= (1.25 * (i + 1) as f64 / 8.0).ceil() as usize,
+                "{max} at {i}"
+            );
+        }
     }
 }
