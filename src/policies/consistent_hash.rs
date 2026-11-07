@@ -28,12 +28,16 @@ pub const LOAD_FACTOR_ENV: &str = "VLLM_ROUTER_CONSISTENT_HASH_LOAD_FACTOR";
 /// A known session keeps its worker until that worker exceeds this multiple of the
 /// mean in-flight requests (default 2); it is then placed again as a new session.
 pub const MOVE_FACTOR_ENV: &str = "VLLM_ROUTER_CONSISTENT_HASH_MOVE_FACTOR";
+/// Sequences one engine runs at once (its `max_num_seqs`). The in-flight floor below
+/// which a worker never moves a known session is the lower of this and 64, so a
+/// saturated engine of a small cap can shed sessions; unset keeps the floor at 64.
+pub const ENGINE_CAPACITY_ENV: &str = "VLLM_ROUTER_CONSISTENT_HASH_ENGINE_CAPACITY";
 /// Known sessions kept; past this, entries idle longer than SESSION_TTL are dropped.
 const MAX_SESSIONS: usize = 1 << 20;
 const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
 /// A worker with fewer requests in flight is never hot enough to move a known
 /// session; at low fleet load this keeps a session and its abort on one worker.
-const MIN_MOVE_LOAD: usize = 64;
+const DEFAULT_MIN_MOVE_LOAD: usize = 64;
 
 /// Consistent hashing policy
 ///
@@ -47,6 +51,8 @@ pub struct ConsistentHashPolicy {
     current_workers: RwLock<Vec<String>>,
     /// Placement and move factors; None keeps plain consistent hashing.
     load_factor: Option<(f64, f64)>,
+    /// In-flight floor below which a known session is never moved.
+    min_move_load: usize,
     /// Known sessions: worker URL and last use.
     sessions: dashmap::DashMap<String, (String, std::time::Instant)>,
 }
@@ -58,7 +64,21 @@ impl ConsistentHashPolicy {
             value.filter(|c| c.is_finite() && *c > 1.0)
         };
         let moved = factor(MOVE_FACTOR_ENV).unwrap_or(2.0);
-        Self::with_load_factor(factor(LOAD_FACTOR_ENV).map(|c| (c, moved.max(c))))
+        let policy = Self::with_load_factor(factor(LOAD_FACTOR_ENV).map(|c| (c, moved.max(c))));
+        match std::env::var(ENGINE_CAPACITY_ENV)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+        {
+            Some(capacity) => policy.with_engine_capacity(capacity),
+            None => policy,
+        }
+    }
+
+    /// Cap the move floor at the engine's sequence capacity.
+    pub fn with_engine_capacity(mut self, capacity: usize) -> Self {
+        self.min_move_load = capacity.min(DEFAULT_MIN_MOVE_LOAD);
+        self
     }
 
     pub fn with_load_factor(load_factor: Option<(f64, f64)>) -> Self {
@@ -66,6 +86,7 @@ impl ConsistentHashPolicy {
             hash_ring: RwLock::new(BTreeMap::new()),
             current_workers: RwLock::new(Vec::new()),
             load_factor,
+            min_move_load: DEFAULT_MIN_MOVE_LOAD,
             sessions: dashmap::DashMap::new(),
         }
     }
@@ -85,7 +106,7 @@ impl ConsistentHashPolicy {
         let index_of = |url: &str| workers.iter().position(|w| w.url() == url);
         let now = std::time::Instant::now();
         if let Some(mut known) = self.sessions.get_mut(key) {
-            let stays = |i: usize| fits(i, moved) || workers[i].load() < MIN_MOVE_LOAD;
+            let stays = |i: usize| fits(i, moved) || workers[i].load() < self.min_move_load;
             if let Some(i) = index_of(&known.0).filter(|&i| workers[i].is_healthy() && stays(i)) {
                 known.1 = now;
                 return i;
@@ -683,6 +704,29 @@ mod tests {
         let first = pick(&bounded, &workers, "s");
         workers[first].increment_load();
         assert_eq!(pick(&bounded, &workers, "s"), first);
+    }
+
+    #[test]
+    fn bounded_load_moves_a_known_session_off_a_saturated_worker_below_the_default_floor() {
+        // Engines capped at 24 sequences never reach the default floor of 64, so the
+        // move factor must still fire once a worker holds a full batch of 24.
+        let workers = bounded_fixture(8);
+        let capped = || ConsistentHashPolicy::with_load_factor(Some((1.15, 2.0)));
+        let default_floor = capped();
+        let cap_floor = capped().with_engine_capacity(24);
+        // A capacity above the default leaves the floor at 64.
+        assert_eq!(capped().with_engine_capacity(72).min_move_load, 64);
+        let first = pick(&default_floor, &workers, "s");
+        assert_eq!(pick(&cap_floor, &workers, "s"), first);
+        // The worker holds 23 of 24 sequences and is over the 2x move bound (ceil(2 *
+        // 25 / 8) = 7): still below the cap, so the session stays.
+        (0..23).for_each(|_| workers[first].increment_load());
+        assert_eq!(pick(&cap_floor, &workers, "s"), first);
+        // At 24 it is saturated: the session is placed again, off the hot worker.
+        workers[first].increment_load();
+        assert_ne!(pick(&cap_floor, &workers, "s"), first);
+        // The default floor keeps it there; 24 in flight is below 64.
+        assert_eq!(pick(&default_floor, &workers, "s"), first);
     }
 
     #[test]
